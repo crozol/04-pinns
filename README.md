@@ -1,48 +1,48 @@
 # Physics-Informed Neural Networks (PINNs)
 
-Resolver ecuaciones en derivadas parciales (PDEs) usando redes neuronales cuyo loss incluye el residual de la PDE (Raissi, Perdikaris & Karniadakis, 2019).
+Solving partial differential equations (PDEs) with neural networks whose loss includes the PDE residual (Raissi, Perdikaris & Karniadakis, 2019).
 
-## Motivación
+## Motivation
 
-Un PINN es una red neuronal `u_θ(x, t)` cuyo loss combina:
+A PINN is a neural network `u_θ(x, t)` whose loss combines:
 
-1. **Condiciones iniciales / de frontera** (datos observados u impuestos).
-2. **Residual de la PDE** evaluado en puntos del dominio, calculado con `autograd`.
+1. **Initial / boundary conditions** (observed or imposed data).
+2. **PDE residual** evaluated at collocation points in the domain, computed with `autograd`.
 
-El modelo aprende a satisfacer la PDE en sentido clásico sin necesidad de mallado como un método numérico tradicional. Este proyecto implementa:
+The model learns to satisfy the PDE in the classical sense, without needing a mesh like a traditional numerical method. This project implements:
 
-- **Ecuación del calor 1D**: como caso mínimo para validar contra la solución analítica.
-- **Ecuación de Burgers 1D**: caso no lineal clásico, con discontinuidad emergente.
+- **1D heat equation**: a minimal case to validate against the analytical solution.
+- **1D Burgers equation**: classic nonlinear case, with emergent discontinuity.
 
 ## Stack
 
 - Python 3.11+
-- PyTorch 2.x (autograd para derivadas parciales)
-- NumPy, SciPy (soluciones de referencia)
+- PyTorch 2.x (autograd for partial derivatives)
+- NumPy, SciPy (reference solutions)
 - Matplotlib
 
-## Estructura
+## Structure
 
 ```
 04-pinns/
 ├── README.md
 ├── requirements.txt
 ├── src/
-│   ├── pinn.py           # Red neuronal u_theta(x, t)
-│   ├── physics.py        # Residuales PDE (heat, Burgers)
-│   └── train.py          # Training loop con loss compuesto
+│   ├── pinn.py           # u_theta(x, t) neural network
+│   ├── physics.py        # PDE residuals (heat, Burgers)
+│   └── train.py          # Training loop with composite loss
 └── notebooks/
 ```
 
 ## Roadmap
 
-- [ ] Implementar MLP con activación `tanh` (diferenciable dos veces).
-- [ ] Función `residual_heat(u, x, t)` usando `torch.autograd.grad`.
-- [ ] Función `residual_burgers(u, x, t, nu)`.
-- [ ] Training loop que muestrea puntos de collocation y enforce boundary/initial.
-- [ ] Validación contra solución analítica (heat) y solución numérica (Burgers).
-- [ ] Gráficas espacio-tiempo + blog post.
+- [ ] Implement MLP with `tanh` activation (twice-differentiable).
+- [ ] `residual_heat(u, x, t)` function using `torch.autograd.grad`.
+- [ ] `residual_burgers(u, x, t, nu)` function.
+- [ ] Training loop sampling collocation points and enforcing boundary / initial conditions.
+- [ ] Validation against analytical solution (heat) and reference numerical solution (Burgers).
+- [ ] Space-time figures + blog post.
 
-## Resultado esperado
+## Expected results
 
-Error L2 relativo < 1% contra la solución analítica de la ecuación del calor, y < 5% contra la solución numérica de referencia en Burgers.
+Relative L² error < 1% against the analytical heat equation solution, and < 5% against the high-resolution numerical reference for Burgers.

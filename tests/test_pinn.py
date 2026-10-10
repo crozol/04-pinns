@@ -32,7 +32,7 @@ def test_train_heat_smoke_loss_decreases():
     """A short run (not expected to converge) should still reduce the loss
     on average — catches a broken loss/optimizer wiring without paying for a
     full training run in CI."""
-    _, history = train_heat(n_collocation=200, n_boundary=50, n_initial=50, epochs=100, lr=1e-2)
+    _, history, _ = train_heat(n_collocation=200, n_boundary=50, n_initial=50, epochs=100, lr=1e-2)
     early = sum(history[:10]) / 10
     late = sum(history[-10:]) / 10
     assert late < early

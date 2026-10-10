@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](https://opensource.org/licenses/MIT)
 [![Portfolio page](https://img.shields.io/badge/Portfolio-page-7C3AED?style=flat-square)](https://crozol.github.io/projects/04-pinns.html)
 
-**TL;DR** — Two PDEs solved with physics-informed neural networks (Raissi, Perdikaris & Karniadakis, 2019): the loss combines the PDE residual, computed via automatic differentiation at collocation points, with the initial/boundary conditions — no mesh, no training data beyond those conditions. The 1D heat equation reaches **0.45% relative L2 error** against its exact analytical solution with Adam alone. The 1D viscous Burgers equation (`nu = 0.01/pi`, the classic benchmark with a thin internal layer at `x = 0`) is harder: Adam alone plateaus at **~9%**, above target; following Raissi et al.'s own recipe — L-BFGS fine-tuning on top of Adam — brings it to **2.04%** against a Chebyshev-spectral numerical reference. Getting there surfaced a real, silent failure mode in naive L-BFGS + PINNs, documented in Section 5.4. Stack: PyTorch (autograd, `torch.optim.LBFGS`) · NumPy/SciPy (reference solutions) · Matplotlib.
+**TL;DR** — Two PDEs solved with physics-informed neural networks (Raissi, Perdikaris & Karniadakis, 2019): the loss combines the PDE residual, computed via automatic differentiation at collocation points, with the initial/boundary conditions — no mesh, no training data beyond those conditions. The 1D heat equation reaches **0.45% relative L2 error** against its exact analytical solution with Adam alone — a short L-BFGS pass pushes the frozen run shown here to **0.23%**. The 1D viscous Burgers equation (`nu = 0.01/pi`, the classic benchmark with a thin internal layer at `x = 0`) is harder: Adam alone plateaus at **~8.8%**, above target; following Raissi et al.'s own recipe — L-BFGS fine-tuning on top of Adam — brings it to **1.92%** against a Chebyshev-spectral numerical reference. Getting there surfaced a real, silent failure mode in naive L-BFGS + PINNs, documented in Section 5.4. Stack: PyTorch (autograd, `torch.optim.LBFGS`) · NumPy/SciPy (reference solutions) · Matplotlib.
 
 The document walks through both cases in the order they were actually solved —
 including the point where the obvious approach quietly didn't work — rather
@@ -93,13 +93,17 @@ It is the sanity check that the PINN machinery — the residual, the autograd
 chain, the composite loss — is wired correctly before attempting something
 harder.
 
-Adam, 5000 epochs, 10k collocation points, no second-order fine-tuning:
+Adam, 5000 epochs, 10k collocation points, reaches **0.45% relative L2
+error** on its own — already well past the <1% target, with no second-order
+fine-tuning needed. The frozen run below adds a short L-BFGS pass anyway
+(for consistency with the Burgers pipeline in `main.py`), which pushes it
+further to **0.23%**:
 
 ![Heat equation: PINN vs. analytical solution](figures/heat_comparison.png)
 
-**Relative L2 error: 0.45%** (target was <1%). The rightmost panel — the
-pointwise difference between the PINN and the exact solution — is essentially
-blank. This is the case where the simplest possible recipe just works.
+The rightmost panel — the pointwise difference between the PINN and the
+exact solution — is essentially blank. This is the case where the simplest
+possible recipe already works.
 
 ## 5 · The Burgers equation
 
@@ -203,12 +207,12 @@ With that single change, 1000 L-BFGS iterations on a fixed batch of 40k
 collocation / 800 boundary / 800 initial points:
 
 ```
-[L-BFGS] final loss = 4.288232e-04
+[L-BFGS] final loss = 4.525385e-04
 ```
 
 ![Burgers equation: PINN vs. spectral reference](figures/burgers_comparison.png)
 
-**Relative L2 error: 2.04%** (target was <5%), down from 8.8% with Adam
+**Relative L2 error: 1.92%** (target was <5%), down from ~8.8% with Adam
 alone. The error map (rightmost panel) is now concentrated almost entirely in
 a thin vertical band right at the internal layer — exactly where the solution
 is hardest to represent — rather than spread across the domain, which is the
@@ -220,7 +224,9 @@ a genuinely hard local feature, not one that is broken.
 ![Burgers PINN training loss: Adam plateaus, L-BFGS does not](figures/burgers_loss_curve.png)
 
 The heat equation's loss (not pictured — it simply decays smoothly to
-`6.7 × 10⁻⁵` with Adam alone) never needed this. Two things make Burgers
+`6.7 × 10⁻⁵` with Adam alone, then to `3.1 × 10⁻⁶` after the same short
+L-BFGS pass) never *needed* the second optimizer the way Burgers did. Two
+things make Burgers
 different: the nonlinear `u·u_x` term couples every collocation point's
 residual to the local value and slope of `u` itself, unlike the heat
 equation's linear residual; and the thin internal layer concentrates nearly
@@ -266,6 +272,8 @@ on Burgers, not a qualitative change in the conclusions above.
 │   ├── physics.py         # PDE residuals (heat, Burgers) + exact heat solution
 │   ├── reference.py        # Chebyshev-spectral numerical reference for Burgers
 │   └── train.py            # Adam training loop + fixed-batch L-BFGS fine-tuning
+├── scripts/
+│   └── export_json.py       # arrays -> JSON for the portfolio page's interactive charts
 ├── tests/                  # pytest: residual correctness, reference sanity, training smoke test
 └── figures/                 # PINN-vs-reference comparison plots + loss curve (tracked)
 ```

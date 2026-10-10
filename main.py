@@ -1,5 +1,5 @@
 """Full pipeline: train both PINNs, validate against their reference
-solutions, and save space-time figures + a metrics.json summary.
+solutions, and save space-time figures + arrays + a metrics.json summary.
 
 Usage: python main.py
 """
@@ -58,7 +58,7 @@ def _space_time_figure(x, t, u_pred, u_ref, title: str, path: Path) -> None:
 
 
 def run_heat() -> dict:
-    model, history = train_heat(
+    model, adam_hist, lbfgs_hist = train_heat(
         n_collocation=10_000, n_boundary=200, n_initial=200, epochs=5000, lr=1e-3, lbfgs_iter=500
     )
     x = np.linspace(0, 1, 101)
@@ -68,25 +68,37 @@ def run_heat() -> dict:
     u_exact = exact_heat(X, T, alpha=1.0)
     err = _relative_l2(u_pred, u_exact)
     _space_time_figure(x, t, u_pred, u_exact, f"Heat equation (rel. L2 error = {err:.2%})", FIGURES / "heat_comparison.png")
+
     RESULTS.mkdir(exist_ok=True)
     torch.save(model.state_dict(), RESULTS / "heat_model.pt")
-    return {"relative_l2_error": err, "final_loss": history[-1]}
+    np.savez(
+        RESULTS / "heat_arrays.npz",
+        x=x, t=t, u_pred=u_pred, u_exact=u_exact,
+        adam_loss=np.array(adam_hist), lbfgs_loss=np.array(lbfgs_hist),
+    )
+    return {"relative_l2_error": err, "final_loss": (lbfgs_hist or adam_hist)[-1]}
 
 
 def run_burgers() -> dict:
     # L-BFGS refinement matters a lot more here than for heat: Adam alone
     # plateaus around 9% relative L2 error (the thin viscous layer at x=0 is
     # hard to fit with first-order updates); L-BFGS brings it to ~2%.
-    model, history = train_burgers(
+    model, adam_hist, lbfgs_hist = train_burgers(
         n_collocation=10_000, n_boundary=200, n_initial=200, epochs=8000, lr=1e-3, lbfgs_iter=1000
     )
     x, t, u_ref = burgers_reference(n=256, nt=201)
     u_pred = _predict_grid(model, x, t)
     err = _relative_l2(u_pred, u_ref)
     _space_time_figure(x, t, u_pred, u_ref, f"Burgers equation (rel. L2 error = {err:.2%})", FIGURES / "burgers_comparison.png")
+
     RESULTS.mkdir(exist_ok=True)
     torch.save(model.state_dict(), RESULTS / "burgers_model.pt")
-    return {"relative_l2_error": err, "final_loss": history[-1]}
+    np.savez(
+        RESULTS / "burgers_arrays.npz",
+        x=x, t=t, u_pred=u_pred, u_ref=u_ref,
+        adam_loss=np.array(adam_hist), lbfgs_loss=np.array(lbfgs_hist),
+    )
+    return {"relative_l2_error": err, "final_loss": (lbfgs_hist or adam_hist)[-1]}
 
 
 if __name__ == "__main__":

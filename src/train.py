@@ -29,28 +29,30 @@ def _optimize(model: PINN, loss_fn, epochs: int, lr: float, log_every: int) -> l
     return history
 
 
-def refine_lbfgs(model: PINN, loss_fn, max_iter: int = 500) -> float:
+def refine_lbfgs(model: PINN, loss_fn, max_iter: int = 500) -> tuple[float, list[float]]:
     """Second-order fine-tuning after Adam, as in Raissi et al. (2019) —
     Adam gets close quickly, L-BFGS squeezes out the remaining error that
     Adam's first-order updates converge to only very slowly. `loss_fn` must
-    be deterministic (fixed points), not resample on every call."""
+    be deterministic (fixed points), not resample on every call. Returns the
+    final loss and the loss at every closure evaluation (includes line-search
+    probes, so it is noisier than the Adam history, not strictly monotonic)."""
     opt = torch.optim.LBFGS(
         model.parameters(), lr=1.0, max_iter=max_iter,
         tolerance_grad=1e-10, tolerance_change=1e-12,
         history_size=50, line_search_fn="strong_wolfe",
     )
-    last_loss = {"value": float("nan")}
+    history: list[float] = []
 
     def closure():
         opt.zero_grad()
         loss, parts = loss_fn()
         loss.backward()
-        last_loss["value"] = loss.item()
+        history.append(loss.item())
         return loss
 
     opt.step(closure)
-    print(f"[L-BFGS] final loss = {last_loss['value']:.6e}")
-    return last_loss["value"]
+    print(f"[L-BFGS] final loss = {history[-1]:.6e}")
+    return history[-1], history
 
 
 def _heat_loss_fn(model, x_f, t_f, x_b0, x_b1, t_b, x_i, t_i, alpha):
@@ -92,8 +94,10 @@ def train_heat(
     device: str = "cpu",
     seed: int = 0,
     lbfgs_iter: int = 0,
-) -> tuple[PINN, list[float]]:
-    """Domain x in [0, 1], t in [0, 1]. IC u(x, 0) = sin(pi x). BC u(0, t) = u(1, t) = 0."""
+) -> tuple[PINN, list[float], list[float]]:
+    """Domain x in [0, 1], t in [0, 1]. IC u(x, 0) = sin(pi x). BC u(0, t) = u(1, t) = 0.
+    Returns (model, adam_history, lbfgs_history) — lbfgs_history is empty if
+    lbfgs_iter == 0."""
     torch.manual_seed(seed)
     model = PINN((2, 64, 64, 64, 1)).to(device)
 
@@ -103,10 +107,13 @@ def train_heat(
 
     history = _optimize(model, loss_fn, epochs, lr, log_every=500)
 
+    lbfgs_history: list[float] = []
     if lbfgs_iter > 0:
         fixed_batch = _sample_heat_batch(4 * n_collocation, 4 * n_boundary, 4 * n_initial, device)
-        refine_lbfgs(model, lambda: _heat_loss_fn(model, *fixed_batch, alpha=alpha), max_iter=lbfgs_iter)
-    return model, history
+        _, lbfgs_history = refine_lbfgs(
+            model, lambda: _heat_loss_fn(model, *fixed_batch, alpha=alpha), max_iter=lbfgs_iter
+        )
+    return model, history, lbfgs_history
 
 
 def _burgers_loss_fn(model, x_f, t_f, x_bm1, x_bp1, t_b, x_i, nu):
@@ -147,9 +154,11 @@ def train_burgers(
     device: str = "cpu",
     seed: int = 0,
     lbfgs_iter: int = 0,
-) -> tuple[PINN, list[float]]:
+) -> tuple[PINN, list[float], list[float]]:
     """Domain x in [-1, 1], t in [0, 1]. IC u(x, 0) = -sin(pi x). BC u(-1, t) = u(1, t) = 0.
-    Classic setup from Raissi, Perdikaris & Karniadakis (2019), nu = 0.01 / pi."""
+    Classic setup from Raissi, Perdikaris & Karniadakis (2019), nu = 0.01 / pi.
+    Returns (model, adam_history, lbfgs_history) — lbfgs_history is empty if
+    lbfgs_iter == 0."""
     torch.manual_seed(seed)
     model = PINN((2, 64, 64, 64, 1)).to(device)
 
@@ -159,7 +168,10 @@ def train_burgers(
 
     history = _optimize(model, loss_fn, epochs, lr, log_every=500)
 
+    lbfgs_history: list[float] = []
     if lbfgs_iter > 0:
         fixed_batch = _sample_burgers_batch(4 * n_collocation, 4 * n_boundary, 4 * n_initial, device)
-        refine_lbfgs(model, lambda: _burgers_loss_fn(model, *fixed_batch, nu=nu), max_iter=lbfgs_iter)
-    return model, history
+        _, lbfgs_history = refine_lbfgs(
+            model, lambda: _burgers_loss_fn(model, *fixed_batch, nu=nu), max_iter=lbfgs_iter
+        )
+    return model, history, lbfgs_history

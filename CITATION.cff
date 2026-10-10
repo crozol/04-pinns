@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "Physics-Informed Neural Networks (PINNs)"
+abstract: "Physics-informed neural networks for the 1D heat equation and the 1D viscous Burgers equation. The heat-equation model is validated against the exact separation-of-variables solution; the Burgers model is validated against a Chebyshev spectral reference solution (Raissi, Perdikaris & Karniadakis, 2019)."
+authors:
+  - given-names: "Camilo Andrés"
+    family-names: "Rozo Lozano"
+    affiliation: "Universidad Nacional de Colombia"
+    email: rozol.ca555@gmail.com
+repository-code: "https://github.com/crozol/04-pinns"
+license: MIT
+version: "1.0.0"
+date-released: 2026-10-10
+keywords:
+  - physics-informed neural networks
+  - PINN
+  - partial differential equations
+  - heat equation
+  - Burgers equation
+  - automatic differentiation
+  - PyTorch

@@ -11,6 +11,8 @@ env/
 dist/
 build/
 checkpoints/
+results/
 *.pt
 *.pth
 *.log
+# figures/ is tracked — contains the final PNGs embedded in README.md

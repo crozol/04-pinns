@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](https://opensource.org/licenses/MIT)
 [![Portfolio page](https://img.shields.io/badge/Portfolio-page-7C3AED?style=flat-square)](https://crozol.github.io/projects/04-pinns.html)
 
-**TL;DR** — Two PDEs solved with physics-informed neural networks (Raissi, Perdikaris & Karniadakis, 2019): the loss combines the PDE residual, computed via automatic differentiation at collocation points, with the initial/boundary conditions — no mesh, no training data beyond those conditions. The 1D heat equation reaches **0.45% relative L2 error** against its exact analytical solution with Adam alone — a short L-BFGS pass pushes the frozen run shown here to **0.23%**. The 1D viscous Burgers equation (`nu = 0.01/pi`, the classic benchmark with a thin internal layer at `x = 0`) is harder: Adam alone plateaus at **~8.8%**, above target; following Raissi et al.'s own recipe — L-BFGS fine-tuning on top of Adam — brings it to **1.92%** against a Chebyshev-spectral numerical reference. Getting there surfaced a real, silent failure mode in naive L-BFGS + PINNs, documented in Section 5.4. Stack: PyTorch (autograd, `torch.optim.LBFGS`) · NumPy/SciPy (reference solutions) · Matplotlib.
+**TL;DR** — Two PDEs solved with physics-informed neural networks (Raissi, Perdikaris & Karniadakis, 2019): the loss combines the PDE residual, computed via automatic differentiation at collocation points, with the initial/boundary conditions — no mesh, no training data beyond those conditions. The 1D heat equation reaches **0.45% relative L2 error** against its exact analytical solution with Adam alone — a short L-BFGS pass pushes the frozen run shown here to **0.23%**. The 1D viscous Burgers equation (`nu = 0.01/pi`, the classic benchmark with a thin internal layer at `x = 0`) is harder: Adam alone plateaus at **~8.8%**, above target; following Raissi et al.'s own recipe — L-BFGS fine-tuning on top of Adam — brings it to **1.92%** against a Chebyshev-spectral numerical reference. Getting there surfaced a real, silent failure mode in naive L-BFGS + PINNs, documented in Section 5.4. A 5-seed sweep (Section 7) confirms neither number is a lucky draw: **0.14% ± 0.05%** (heat) and **1.64% ± 0.34%** (Burgers) across independent reruns, every single seed clearing its target. Stack: PyTorch (autograd, `torch.optim.LBFGS`) · NumPy/SciPy (reference solutions) · Matplotlib.
 
 The document walks through both cases in the order they were actually solved —
 including the point where the obvious approach quietly didn't work — rather
@@ -25,9 +25,10 @@ than only presenting the final, polished numbers.
    - [5.4 · Diagnosing the plateau — and a silent L-BFGS failure](#54--diagnosing-the-plateau--and-a-silent-l-bfgs-failure)
    - [5.5 · The fix and the final result](#55--the-fix-and-the-final-result)
 6. [Head-to-head: why Burgers is harder](#6--head-to-head-why-burgers-is-harder)
-7. [Reproducing](#7--reproducing)
-8. [File map](#8--file-map)
-9. [References](#9--references)
+7. [Robustness: does it hold across seeds?](#7--robustness-does-it-hold-across-seeds)
+8. [Reproducing](#8--reproducing)
+9. [File map](#9--file-map)
+10. [References](#10--references)
 
 ---
 
@@ -237,7 +238,42 @@ not an artifact of this particular implementation — which is exactly why
 Raissi et al.'s original recipe already includes the L-BFGS stage this
 project needed to rediscover.
 
-## 7 · Reproducing
+## 7 · Robustness: does it hold across seeds?
+
+Every number above comes from one frozen run (seed 0). Training is genuinely
+stochastic — collocation points resample every Adam step, the L-BFGS fixed
+batch is itself a random draw, and the network's initial weights depend on
+the seed — so a single run could in principle be a lucky draw. `scripts/seed_sweep.py`
+retrains each PINN end-to-end (full Adam + L-BFGS pipeline) across 5
+independent seeds, mirroring the n=5 seed error bars used for the Neural
+ODEs project (02):
+
+**Heat equation** — mean ± std: **0.14% ± 0.05%** (range 0.10%–0.23%)
+
+| seed | 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| relative L2 error | 0.23% | 0.13% | 0.10% | 0.14% | 0.12% |
+
+**Burgers equation** — mean ± std: **1.64% ± 0.34%** (range 1.14%–1.92%)
+
+| seed | 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| relative L2 error | 1.92% | 1.86% | 1.43% | 1.86% | 1.14% |
+
+Both equations clear their targets (<1% heat, <5% Burgers) on *every* one of
+the 5 seeds, not just the featured run — the method is robust, not a
+one-off. Seed 0, used for every figure and number elsewhere in this
+document, happens to be the **worst** of the five seeds for both equations
+(highest error in both tables above). If anything, the headline numbers
+quoted throughout this README undersell the typical case rather than
+flatter it.
+
+```bash
+python -m scripts.seed_sweep --equation heat --seeds 5
+python -m scripts.seed_sweep --equation burgers --seeds 5
+```
+
+## 8 · Reproducing
 
 ```bash
 pip install -r requirements.txt
@@ -258,7 +294,7 @@ on Burgers, not a qualitative change in the conclusions above.
 | Burgers (Adam, 8000 epochs) | ~9 min |
 | Burgers (L-BFGS, 1000 iters, fixed batch) | ~7 min |
 
-## 8 · File map
+## 9 · File map
 
 ```
 04-pinns/
@@ -273,12 +309,13 @@ on Burgers, not a qualitative change in the conclusions above.
 │   ├── reference.py        # Chebyshev-spectral numerical reference for Burgers
 │   └── train.py            # Adam training loop + fixed-batch L-BFGS fine-tuning
 ├── scripts/
-│   └── export_json.py       # arrays -> JSON for the portfolio page's interactive charts
+│   ├── export_json.py        # arrays -> JSON for the portfolio page's interactive charts
+│   └── seed_sweep.py          # n=5 seed robustness check (mean +/- std relative L2 error)
 ├── tests/                  # pytest: residual correctness, reference sanity, training smoke test
 └── figures/                 # PINN-vs-reference comparison plots + loss curve (tracked)
 ```
 
-## 9 · References
+## 10 · References
 
 - Raissi, M., Perdikaris, P., & Karniadakis, G. E. (2019). *Physics-informed
   neural networks: A deep learning framework for solving forward and inverse

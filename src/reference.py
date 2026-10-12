@@ -1,9 +1,12 @@
-"""High-resolution numerical reference solutions used to validate the PINNs.
+"""Reference solutions used to validate the PINNs.
 
 Heat equation has a closed-form analytical solution (see physics.exact_heat).
-Burgers equation does not for this IC/BC, so we integrate the semi-discretized
+For Burgers, `burgers_exact` evaluates the exact Cole-Hopf solution and is
+the ground truth every reported error is measured against. `burgers_reference`
+is an independent numerical cross-check: it integrates the semi-discretized
 PDE with a Chebyshev spectral method in x (as in Raissi et al. 2019) and a
-stiff implicit time integrator. A plain central-difference finite-difference
+stiff implicit time integrator, and differs from the exact solution by 0.40%
+relative L2 (max. 0.035, inside the viscous layer). A plain central-difference finite-difference
 discretization was tried first and produced spurious oscillations: the
 viscous layer that forms near x=0 (nu = 0.01/pi is small) is thinner than the
 grid spacing can resolve without numerical dispersion. The spectral method
@@ -63,3 +66,35 @@ def burgers_reference(
     x = x_desc[order]
     u = u_desc[:, order]
     return x, t_eval, u
+
+
+def burgers_exact(
+    x: np.ndarray, t: np.ndarray, nu: float = NU_BURGERS, n_quad: int = 8001
+) -> np.ndarray:
+    """Exact solution via the Cole-Hopf transformation (Basdevant et al., 1986).
+
+    With u = -2 nu (ln phi)_x the equation becomes the heat equation for phi,
+    and for u(x, 0) = -sin(pi x) (whose 2-periodic extension satisfies the
+    boundary conditions) the solution is the ratio of two Gaussian integrals:
+
+        u(x, t) = ∫ (eta / t) w(eta) d eta / ∫ w(eta) d eta,
+        w(eta)  = exp( -cos(pi (x - eta)) / (2 pi nu) - eta^2 / (4 nu t) ).
+
+    Both integrals are evaluated by the trapezoid rule on a fine eta grid,
+    with the exponent shifted by its maximum for numerical stability.
+    Returns U[i, j] = u(x[j], t[i]).
+    """
+    x = np.asarray(x, dtype=float)
+    t = np.asarray(t, dtype=float)
+    out = np.empty((t.size, x.size))
+    for i, ti in enumerate(t):
+        if ti == 0.0:
+            out[i] = -np.sin(np.pi * x)
+            continue
+        half = min(1.0, 12.0 * np.sqrt(4.0 * nu * ti))   # Gaussian is negligible beyond
+        eta = np.linspace(-half, half, n_quad)
+        expo = (-np.cos(np.pi * (x[:, None] - eta[None, :])) / (2.0 * np.pi * nu)
+                - eta[None, :] ** 2 / (4.0 * nu * ti))
+        w = np.exp(expo - expo.max(axis=1, keepdims=True))
+        out[i] = np.trapezoid(eta * w, eta, axis=1) / (ti * np.trapezoid(w, eta, axis=1))
+    return out

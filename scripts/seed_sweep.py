@@ -5,9 +5,13 @@ lucky draw. This retrains from scratch across several seeds and reports the
 relative L2 error as mean +/- std, mirroring the n=5 seed error bars used
 for the Neural ODEs project (02).
 
+Burgers errors are measured against the exact Cole-Hopf solution on the
+256 x 100 grid of Raissi et al. (2019); heat errors against the closed form.
+
 Usage:
     python -m scripts.seed_sweep --equation burgers --seeds 5
     python -m scripts.seed_sweep --equation heat --seeds 5
+    python -m scripts.seed_sweep --equation burgers --seed-list 3 --out results/s3.json
 """
 from __future__ import annotations
 
@@ -20,7 +24,7 @@ import numpy as np
 import torch
 
 from src.physics import exact_heat
-from src.reference import burgers_reference
+from src.reference import burgers_exact
 from src.train import train_burgers, train_heat
 
 
@@ -35,7 +39,9 @@ def _predict_grid(model, x: np.ndarray, t: np.ndarray) -> np.ndarray:
 
 
 def _run_burgers_seed(seed: int):
-    x, t, u_ref = burgers_reference(n=256, nt=201)
+    x = np.linspace(-1, 1, 256)
+    t = np.linspace(0, 1, 100)
+    u_ref = burgers_exact(x, t)
     model, adam_hist, lbfgs_hist = train_burgers(
         n_collocation=10_000, n_boundary=200, n_initial=200,
         epochs=8000, lr=1e-3, lbfgs_iter=1000, seed=seed,
@@ -62,11 +68,12 @@ def _run_heat_seed(seed: int):
 RUNNERS = {"burgers": _run_burgers_seed, "heat": _run_heat_seed}
 
 
-def main(equation: str, n_seeds: int, out_path: str) -> None:
+def main(equation: str, seeds: list[int], out_path: str) -> None:
     runner = RUNNERS[equation]
+    n_seeds = len(seeds)
 
     results = []
-    for seed in range(n_seeds):
+    for seed in seeds:
         t0 = time.time()
         err, adam_hist, lbfgs_hist = runner(seed)
         elapsed = time.time() - t0
@@ -107,7 +114,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--equation", choices=["heat", "burgers"], default="burgers")
     parser.add_argument("--seeds", type=int, default=5)
+    parser.add_argument("--seed-list", nargs="+", type=int, default=None,
+                        help="explicit seeds (overrides --seeds), e.g. to run seeds in parallel")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
     out_path = args.out or f"results/{args.equation}_seed_sweep.json"
-    main(equation=args.equation, n_seeds=args.seeds, out_path=out_path)
+    seeds = args.seed_list if args.seed_list is not None else list(range(args.seeds))
+    main(equation=args.equation, seeds=seeds, out_path=out_path)

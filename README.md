@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](https://opensource.org/licenses/MIT)
 [![Portfolio page](https://img.shields.io/badge/Portfolio-page-7C3AED?style=flat-square)](https://crozol.github.io/projects/04-pinns.html)
 
-**TL;DR** — Two PDEs solved with physics-informed neural networks (Raissi, Perdikaris & Karniadakis, 2019): the loss combines the PDE residual, computed via automatic differentiation at collocation points, with the initial/boundary conditions — no mesh, no training data beyond those conditions. The 1D heat equation reaches **0.45% relative L2 error** against its exact analytical solution with Adam alone — a short L-BFGS pass pushes the frozen run shown here to **0.23%**. The 1D viscous Burgers equation (`nu = 0.01/pi`, the classic benchmark with a thin internal layer at `x = 0`) is harder: Adam alone plateaus at **~8.8%**, above target; following Raissi et al.'s own recipe — L-BFGS fine-tuning on top of Adam — brings it to **1.92%** against a Chebyshev-spectral numerical reference. Getting there surfaced a real, silent failure mode in naive L-BFGS + PINNs, documented in Section 5.4. A 5-seed sweep (Section 7) confirms neither number is a lucky draw: **0.14% ± 0.05%** (heat) and **1.64% ± 0.34%** (Burgers) across independent reruns, every single seed clearing its target. Stack: PyTorch (autograd, `torch.optim.LBFGS`) · NumPy/SciPy (reference solutions) · Matplotlib.
+**TL;DR** — Two PDEs solved with physics-informed neural networks (Raissi, Perdikaris & Karniadakis, 2019): the loss combines the PDE residual, computed via automatic differentiation at collocation points, with the initial/boundary conditions — no mesh, no training data beyond those conditions. The 1D heat equation reaches **0.23% relative L2 error** against its closed-form solution (Adam + a short L-BFGS pass), but that is a global figure: the PINN's absolute error stays near `10⁻³` while the solution decays by `5 × 10⁻⁵`, so the relative error per time slice passes 10% after `t ≈ 0.6` (Section 4). The 1D viscous Burgers equation (`nu = 0.01/pi`, the classic benchmark with a thin internal layer at `x = 0`) is harder: Adam alone plateaus at **~8.8%**; L-BFGS fine-tuning on a fixed point batch brings it to **1.78%** against the exact Cole-Hopf solution. Getting there surfaced a silent failure mode of L-BFGS with resampled collocation points (Section 5.4). Across 5 seeds the errors are **0.14% ± 0.05%** (heat) and **1.66% ± 0.49%** (Burgers). The original paper reports 0.067% on Burgers; following its recipe (full-batch L-BFGS in float64) gives `7.1 × 10⁻⁴`, `1.15 × 10⁻³` and `2.2 × 10⁻²` on three seeds (Section 9), and the result is sensitive to the untuned boundary-loss weight (Section 8). Stack: PyTorch (autograd, `torch.optim.LBFGS`) · NumPy/SciPy (reference solutions) · Matplotlib.
 
 The document walks through both cases in the order they were actually solved —
 including the point where the obvious approach quietly didn't work — rather
@@ -20,15 +20,17 @@ than only presenting the final, polished numbers.
 4. [The heat equation](#4--the-heat-equation)
 5. [The Burgers equation](#5--the-burgers-equation)
    - [5.1 · Formulation](#51--formulation)
-   - [5.2 · The reference solution — why finite differences failed](#52--the-reference-solution--why-finite-differences-failed)
+   - [5.2 · A numerical cross-check — why finite differences failed](#52--a-numerical-cross-check--why-finite-differences-failed)
    - [5.3 · First attempt: Adam alone](#53--first-attempt-adam-alone)
    - [5.4 · Diagnosing the plateau — and a silent L-BFGS failure](#54--diagnosing-the-plateau--and-a-silent-l-bfgs-failure)
    - [5.5 · The fix and the final result](#55--the-fix-and-the-final-result)
 6. [Head-to-head: why Burgers is harder](#6--head-to-head-why-burgers-is-harder)
 7. [Robustness: does it hold across seeds?](#7--robustness-does-it-hold-across-seeds)
-8. [Reproducing](#8--reproducing)
-9. [File map](#9--file-map)
-10. [References](#10--references)
+8. [Sensitivity to the boundary weight](#8--sensitivity-to-the-boundary-weight)
+9. [Comparison with the original paper](#9--comparison-with-the-original-paper)
+10. [Reproducing](#10--reproducing)
+11. [File map](#11--file-map)
+12. [References](#12--references)
 
 ---
 
@@ -38,9 +40,9 @@ Train a neural network `u_θ(x, t)` to satisfy a partial differential equation
 directly — not by fitting it to a numerically-solved dataset, but by making
 the PDE itself part of the loss function, evaluated via automatic
 differentiation. Validate the result against a reference with no ambiguity
-about ground truth: an exact analytical solution for the heat equation, and a
-high-accuracy numerical solution for Burgers (which has none in closed form
-for this initial condition).
+about ground truth: the closed-form solution for the heat equation, and the
+exact Cole-Hopf solution for Burgers (an integral representation evaluated by
+quadrature), with an independent Chebyshev-spectral solver as a cross-check.
 
 ## 2 · Equipment (software stack)
 
@@ -49,7 +51,8 @@ for this initial condition).
 | Python 3.11+, PyTorch | The network and `torch.autograd.grad` for exact partial derivatives |
 | `torch.optim.Adam` | First-order optimizer, resampled mini-batches every step |
 | `torch.optim.LBFGS` | Second-order fine-tuning, strong-Wolfe line search |
-| NumPy, SciPy (`solve_ivp`) | Chebyshev-spectral reference solution for Burgers |
+| NumPy | Exact Cole-Hopf solution for Burgers (trapezoid quadrature) |
+| SciPy (`solve_ivp`, `qmc`) | Chebyshev-spectral cross-check for Burgers; Latin-hypercube sampling in the paper reproduction |
 | Matplotlib | Static figures |
 
 No GPU is needed. Heat training takes a few minutes on a modern laptop CPU;
@@ -65,6 +68,17 @@ A PINN is a neural network `u_θ(x, t)` whose loss combines three pieces:
 3. **PDE residual** — at randomly sampled interior points ("collocation
    points"), the PDE itself, evaluated using the network's own partial
    derivatives, should equal zero.
+
+Each piece is a mean squared error over its own set of points, and the loss
+is their weighted sum,
+
+```
+L = L_PDE + λ_B · L_boundary + λ_I · L_initial
+```
+
+with `λ_I = 1` for both equations and `λ_B = 2` (the boundary term is the
+mean over both edges, weighted twice). Section 7 measures how sensitive the
+Burgers result is to `λ_B`.
 
 The key trick is `torch.autograd.grad(u, x, create_graph=True)`: since `u` is
 the network's output and `x` is one of its inputs, this computes `∂u/∂x`
@@ -103,8 +117,24 @@ further to **0.23%**:
 ![Heat equation: PINN vs. analytical solution](figures/heat_comparison.png)
 
 The rightmost panel — the pointwise difference between the PINN and the
-exact solution — is essentially blank. This is the case where the simplest
-possible recipe already works.
+exact solution — is essentially blank on a colour scale set by the initial
+amplitude.
+
+That global number needs a qualification. The solution decays by a factor
+`exp(-pi²) ≈ 5 × 10⁻⁵` over `t ∈ [0, 1]`, so a single relative L2 error over
+the whole space-time grid is dominated by the early times, where `u` is of
+order one. Resolving the error in time (`scripts/heat_time_error.py`) shows
+what actually happens: the PINN's **absolute** error stays roughly constant,
+below `1.9 × 10⁻³` at every `t`, while the solution keeps shrinking. The
+**relative** error per time slice is 0.07% at `t = 0`, 1.1% at `t = 0.3` and
+2.4% at `t = 0.5`, crosses 10% at `t ≈ 0.59`, and exceeds 100% from `t ≈ 0.8`
+on, where `|u|` has fallen below the network's error floor.
+
+![Heat equation: amplitude, absolute and relative error against time](figures/heat_error_vs_time.png)
+
+The PINN therefore approximates the solution to a fixed absolute accuracy,
+not a fixed relative one; the 0.23% figure describes the first half of the
+time window well and the second half not at all.
 
 ## 5 · The Burgers equation
 
@@ -116,11 +146,28 @@ from the original PINN paper (Raissi et al., 2019). The nonlinear advection
 term `u·u_x` steepens the odd initial condition toward `x = 0` as `t`
 increases; the small viscosity `nu` keeps the solution smooth but confines
 that steepening to a thin internal layer rather than letting it form a true
-discontinuity. There is no closed-form solution for this IC/BC.
+discontinuity.
 
-### 5.2 · The reference solution — why finite differences failed
+The equation does have an exact solution. The Cole-Hopf substitution
+`u = -2 nu ∂_x ln φ` turns it into the heat equation for `φ`, and for this
+initial condition (Basdevant et al., 1986)
 
-A reference was needed before any PINN result could be judged. The first
+```
+u(x, t) = ∫ (η/t) w(x, η, t) dη / ∫ w(x, η, t) dη,
+w(x, η, t) = exp( -cos(pi (x - η)) / (2 pi nu) - η² / (4 nu t) ).
+```
+
+The integrals have no elementary closed form, but the Gaussian factor
+confines them to `|η| ≲ 12 √(4 nu t)`, and the trapezoid rule on 8001 nodes
+evaluates them to `~10⁻¹⁵` (`src/reference.py::burgers_exact`; the computed
+field satisfies the PDE with a finite-difference residual of `4 × 10⁻¹⁰`).
+Every Burgers error reported below is measured against this solution.
+
+### 5.2 · A numerical cross-check — why finite differences failed
+
+The project first validated Burgers against a numerical solution, before
+switching to the exact one above; that solver is kept as an independent
+cross-check, and building it had its own failure worth recording. The first
 attempt was the obvious one: discretize `x` on a uniform grid, use central
 differences for `u_x` and `u_xx`, and integrate in `t` with a stiff implicit
 solver (`scipy.integrate.solve_ivp`, method `Radau`). On a 201-point grid the
@@ -146,6 +193,13 @@ smooth functions regardless of where a sharp-but-smooth feature sits. With
 (`u(-x, t) = -u(x, t)`) and exactly zero at the boundaries to machine
 precision, both properties guaranteed by the problem's symmetry and checked
 directly in `tests/test_physics.py`.
+
+Compared with the exact solution, the spectral solution has a relative L2
+error of **0.40%** (maximum pointwise error 0.035, inside the internal layer).
+That is small in absolute terms but only a factor of ~5 below the PINN's own
+error, which is why the reported numbers now use the exact solution instead.
+The 8.8% and 1.92% figures in Sections 5.3–5.5 are from the original
+validation against this spectral solution and are labelled as such.
 
 ### 5.3 · First attempt: Adam alone
 
@@ -211,10 +265,11 @@ collocation / 800 boundary / 800 initial points:
 [L-BFGS] final loss = 4.525385e-04
 ```
 
-![Burgers equation: PINN vs. spectral reference](figures/burgers_comparison.png)
+![Burgers equation: PINN vs. exact solution](figures/burgers_comparison.png)
 
-**Relative L2 error: 1.92%** (target was <5%), down from ~8.8% with Adam
-alone. The error map (rightmost panel) is now concentrated almost entirely in
+**Relative L2 error: 1.78%** against the exact solution on the 256 × 100 grid
+of Raissi et al. (1.92% against the spectral solution; target was <5%), down
+from ~8.8% with Adam alone. The error map (rightmost panel) is now concentrated almost entirely in
 a thin vertical band right at the internal layer — exactly where the solution
 is hardest to represent — rather than spread across the domain, which is the
 qualitative signature of a method that is working correctly but running into
@@ -254,31 +309,87 @@ ODEs project (02):
 |---|---|---|---|---|---|
 | relative L2 error | 0.23% | 0.13% | 0.10% | 0.14% | 0.12% |
 
-**Burgers equation** — mean ± std: **1.64% ± 0.34%** (range 1.14%–1.92%)
+**Burgers equation**, against the exact solution — mean ± std: **1.66% ± 0.49%**
+(range 1.05%–2.33%)
 
 | seed | 0 | 1 | 2 | 3 | 4 |
 |---|---|---|---|---|---|
-| relative L2 error | 1.92% | 1.86% | 1.43% | 1.86% | 1.14% |
+| relative L2 error | 1.88% | 1.66% | 1.34% | 2.33% | 1.05% |
 
 Both equations clear their targets (<1% heat, <5% Burgers) on *every* one of
-the 5 seeds, not just the featured run — the method is robust, not a
-one-off. Seed 0, used for every figure and number elsewhere in this
-document, happens to be the **worst** of the five seeds for both equations
-(highest error in both tables above). If anything, the headline numbers
-quoted throughout this README undersell the typical case rather than
-flatter it.
+the 5 seeds, not just the featured run. For heat, seed 0 is the worst of the
+five; for Burgers it sits in the middle, and the frozen run (1.78%) is close
+to the mean. The heat errors are global over `t ∈ [0, 1]` and inherit the
+qualification of Section 4. Seed 0 retrained here gives 1.88% rather than the
+frozen run's 1.78% because training is not bit-for-bit reproducible
+(Section 10); the difference is well inside the seed-to-seed spread.
 
 ```bash
 python -m scripts.seed_sweep --equation heat --seeds 5
 python -m scripts.seed_sweep --equation burgers --seeds 5
 ```
 
-## 8 · Reproducing
+## 8 · Sensitivity to the boundary weight
+
+Uniform loss weights are a known weak point of PINNs: the terms compete
+during training, and their relative scale shapes what the optimizer fits
+first (Wang, Teng & Perdikaris, 2021). The weight `λ_B = 2` used throughout
+was not tuned — it is what the original code did implicitly, summing the two
+per-edge means. `scripts/bc_weight_sweep.py` retrains the Burgers PINN (seed 0,
+full Adam + L-BFGS pipeline) for four values of `λ_B`:
+
+| `λ_B` | 0.5 | 1 | 2 (used) | 4 |
+|---|---|---|---|---|
+| relative L2 error vs. exact | 0.80% | 1.34% | 1.88% | 1.67% |
+
+Lower boundary weights help here, by more than a factor of two between
+`λ_B = 0.5` and `λ_B = 2`. Two caveats limit what this shows: it is a single
+seed, and the seed-to-seed spread at fixed `λ_B` (Section 7) is of the same
+order as some of these differences. The frozen configuration is left at
+`λ_B = 2`: choosing the weight by the same test error that is being reported
+would bias that error downward.
+
+## 9 · Comparison with the original paper
+
+Raissi et al. (2019) report a relative L2 error of `6.7 × 10⁻⁴` (0.067%) on
+this benchmark, about 25 times lower than the 5-seed mean above. Their recipe
+differs in three ways: a deeper, narrower network (20 neurons per hidden
+layer), a fixed set of `N_u = 100` initial/boundary points and `N_f = 10 000`
+Latin-hypercube collocation points, and full-batch L-BFGS run to convergence
+(up to 50 000 iterations) with no Adam phase, in float64.
+`scripts/raissi_repro.py` follows that recipe and measures the result
+against the same exact solution, on the same 256 × 100 grid:
+
+| seed | 0 | 1 | 2 |
+|---|---|---|---|
+| relative L2 error vs. exact | 2.2 × 10⁻² | 7.1 × 10⁻⁴ | 1.15 × 10⁻³ |
+| final loss | 3.3 × 10⁻⁶ | 1.2 × 10⁻⁶ | 1.4 × 10⁻⁶ |
+
+One seed matches the published number, the median is `1.15 × 10⁻³`, and one
+seed stalls at 2.2%, no better than the much cheaper Adam + short L-BFGS
+pipeline. All three runs used their full evaluation budget (62 501 loss
+evaluations, ~8.3 h each on one CPU core) rather than stopping on a
+convergence tolerance. The published figure is therefore reproducible, but it
+is closer to a good draw than to a typical outcome of the recipe, and the
+gap between it and this project's pipeline (about 14× against the median) comes from the
+optimization budget and precision, not from a different formulation.
+
+Two deviations from the paper are known. The paper's text describes "9
+layers"; this reproduction uses 9 hidden layers (3 441 parameters), while the
+authors' released code uses 8 (3 021). The `N_u` points are drawn from the
+exact initial and boundary values rather than the authors' data file, which
+contains the same values.
+
+## 10 · Reproducing
 
 ```bash
 pip install -r requirements.txt
 python main.py        # trains both models, saves figures/ and results/metrics.json
 pytest tests/ -v       # fast correctness checks (no full training run)
+
+python -m scripts.heat_time_error    # heat error resolved in time (reads results/)
+python -m scripts.bc_weight_sweep    # Section 8, ~1 h per weight on one core
+python -m scripts.raissi_repro       # Section 9, ~8 h per seed on one core
 ```
 
 Training is not bit-for-bit reproducible between runs — collocation points
@@ -294,7 +405,7 @@ on Burgers, not a qualitative change in the conclusions above.
 | Burgers (Adam, 8000 epochs) | ~9 min |
 | Burgers (L-BFGS, 1000 iters, fixed batch) | ~7 min |
 
-## 9 · File map
+## 11 · File map
 
 ```
 04-pinns/
@@ -306,17 +417,27 @@ on Burgers, not a qualitative change in the conclusions above.
 ├── src/
 │   ├── pinn.py            # u_theta(x, t) — MLP with Tanh activations (twice-differentiable)
 │   ├── physics.py         # PDE residuals (heat, Burgers) + exact heat solution
-│   ├── reference.py        # Chebyshev-spectral numerical reference for Burgers
+│   ├── reference.py        # exact Cole-Hopf solution + Chebyshev-spectral cross-check for Burgers
 │   └── train.py            # Adam training loop + fixed-batch L-BFGS fine-tuning
 ├── scripts/
 │   ├── export_json.py        # arrays -> JSON for the portfolio page's interactive charts
-│   └── seed_sweep.py          # n=5 seed robustness check (mean +/- std relative L2 error)
+│   ├── seed_sweep.py          # n=5 seed robustness check (mean +/- std relative L2 error)
+│   ├── heat_time_error.py     # heat error per time slice + figure
+│   ├── bc_weight_sweep.py     # Burgers sensitivity to the boundary weight λ_B
+│   └── raissi_repro.py        # Burgers with the original paper's recipe (L-BFGS, float64)
 ├── tests/                  # pytest: residual correctness, reference sanity, training smoke test
 └── figures/                 # PINN-vs-reference comparison plots + loss curve (tracked)
 ```
 
-## 10 · References
+## 12 · References
 
+- Basdevant, C., Deville, M., Haldenwang, P., Lacroix, J. M., Ouazzani, J.,
+  Peyret, R., Orlandi, P., & Patera, A. T. (1986). *Spectral and finite
+  difference solutions of the Burgers equation.* Computers & Fluids, 14(1),
+  23-41. (Exact Cole-Hopf solution, used in `src/reference.py`)
+- Wang, S., Teng, Y., & Perdikaris, P. (2021). *Understanding and mitigating
+  gradient flow pathologies in physics-informed neural networks.* SIAM
+  Journal on Scientific Computing, 43(5), A3055-A3081.
 - Raissi, M., Perdikaris, P., & Karniadakis, G. E. (2019). *Physics-informed
   neural networks: A deep learning framework for solving forward and inverse
   problems involving nonlinear partial differential equations.* Journal of

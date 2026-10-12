@@ -116,14 +116,17 @@ def train_heat(
     return model, history, lbfgs_history
 
 
-def _burgers_loss_fn(model, x_f, t_f, x_bm1, x_bp1, t_b, x_i, nu):
+def _burgers_loss_fn(model, x_f, t_f, x_bm1, x_bp1, t_b, x_i, nu, lambda_bc=2.0):
     u_f = model(x_f, t_f)
     r = burgers_residual(u_f, x_f, t_f, nu=nu)
     loss_pde = (r**2).mean()
 
+    # lambda_bc weights the mean squared boundary error over both edges. The
+    # default 2.0 is the original sum of the two per-edge means, i.e. the
+    # boundary term counts twice as much as the initial-condition term.
     u_bm1 = model(x_bm1, t_b)
     u_bp1 = model(x_bp1, t_b)
-    loss_bc = (u_bm1**2).mean() + (u_bp1**2).mean()
+    loss_bc = lambda_bc * 0.5 * ((u_bm1**2).mean() + (u_bp1**2).mean())
 
     t_i = torch.zeros_like(x_i)
     u_i = model(x_i, t_i)
@@ -154,6 +157,7 @@ def train_burgers(
     device: str = "cpu",
     seed: int = 0,
     lbfgs_iter: int = 0,
+    lambda_bc: float = 2.0,
 ) -> tuple[PINN, list[float], list[float]]:
     """Domain x in [-1, 1], t in [0, 1]. IC u(x, 0) = -sin(pi x). BC u(-1, t) = u(1, t) = 0.
     Classic setup from Raissi, Perdikaris & Karniadakis (2019), nu = 0.01 / pi.
@@ -164,7 +168,7 @@ def train_burgers(
 
     def loss_fn():
         batch = _sample_burgers_batch(n_collocation, n_boundary, n_initial, device)
-        return _burgers_loss_fn(model, *batch, nu=nu)
+        return _burgers_loss_fn(model, *batch, nu=nu, lambda_bc=lambda_bc)
 
     history = _optimize(model, loss_fn, epochs, lr, log_every=500)
 
@@ -172,6 +176,7 @@ def train_burgers(
     if lbfgs_iter > 0:
         fixed_batch = _sample_burgers_batch(4 * n_collocation, 4 * n_boundary, 4 * n_initial, device)
         _, lbfgs_history = refine_lbfgs(
-            model, lambda: _burgers_loss_fn(model, *fixed_batch, nu=nu), max_iter=lbfgs_iter
+            model, lambda: _burgers_loss_fn(model, *fixed_batch, nu=nu, lambda_bc=lambda_bc),
+            max_iter=lbfgs_iter,
         )
     return model, history, lbfgs_history

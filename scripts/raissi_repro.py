@@ -2,9 +2,11 @@
 
 The paper reports a relative L2 error of 6.7e-4 for:
 
-* a tanh network with 20 neurons per hidden layer. The paper's text says
-  "9 layers"; this script uses 9 hidden layers (3 441 parameters), whereas
-  the authors' released code uses 8 hidden layers (3 021 parameters),
+* a tanh network with 8 hidden layers of 20 neurons (3 021 parameters).
+  The paper's "9 layers" counts the output layer: 8 hidden layers is the
+  only depth that gives the 3 021 parameters of the authors' code
+  (7 → 2 601, 9 → 3 441). An earlier version of this script used 9 hidden
+  layers; its three seeds are kept in results/raissi_repro_9hidden.json,
 * N_u = 100 initial/boundary points drawn from the t = 0 and x = ±1 edges,
 * N_f = 10 000 collocation points from a Latin hypercube,
 * loss = MSE_u + MSE_f, minimised by full-batch L-BFGS to convergence
@@ -13,9 +15,16 @@ The paper reports a relative L2 error of 6.7e-4 for:
 This script follows that recipe in float64 PyTorch and measures the error
 against the exact Cole-Hopf solution on the paper's 256 x 100 grid.
 
+With 20 seeds the quantity reported is the failure rate — how many runs of
+the recipe stay above 10^-3 — rather than a median, because one run in three
+stalled in the first, 3-seed attempt. Each seed takes about 8 h on one CPU
+core; seeds are independent, so they are run as parallel processes, each
+writing its own JSON, and combined with --summarize.
+
 Usage:
-    python -m scripts.raissi_repro                    # seeds 0 1 2
-    python -m scripts.raissi_repro --seeds 0 --max-iter 200   # smoke test
+    python -m scripts.raissi_repro --seeds 0 8 16 --out results/raissi/p0.json
+    python -m scripts.raissi_repro --summarize            # results/raissi/*.json
+    python -m scripts.raissi_repro --seeds 0 --max-iter 200 --out results/smoke.json
 """
 
 from __future__ import annotations
@@ -33,7 +42,7 @@ from src.physics import NU_BURGERS, burgers_residual
 from src.pinn import PINN
 from src.reference import burgers_exact
 
-LAYERS = (2,) + (20,) * 9 + (1,)
+LAYERS = (2,) + (20,) * 8 + (1,)
 
 
 def training_points(n_u: int, n_f: int, seed: int):
@@ -118,11 +127,35 @@ def main(seeds: list[int], max_iter: int, out: str) -> None:
     print(f"[ok] {out}")
 
 
+def summarize(pattern: str = "results/raissi/*.json", out: str = "results/raissi_repro.json",
+              threshold: float = 1e-3) -> None:
+    import glob
+
+    runs = sorted((r for f in glob.glob(pattern) for r in json.load(open(f))["runs"]),
+                  key=lambda r: r["seed"])
+    errs = np.array([r["relative_l2_error"] for r in runs])
+    fails = int((errs > threshold).sum())
+    summary = {"n_seeds": len(runs), "paper_error": 6.7e-4, "threshold": threshold,
+               "n_above_threshold": fails, "median": float(np.median(errs)),
+               "quartiles": [float(np.quantile(errs, 0.25)), float(np.quantile(errs, 0.75))],
+               "min": float(errs.min()), "max": float(errs.max()),
+               "n_params": runs[0]["n_params"] if runs else None, "runs": runs}
+    with open(out, "w") as fh:
+        json.dump(summary, fh, indent=2)
+    print(f"{len(runs)} seeds: median {summary['median']:.3e}, IQR {summary['quartiles']}, "
+          f"{fails}/{len(runs)} above {threshold:g}; min {errs.min():.2e}, max {errs.max():.2e}")
+    print(f"[ok] {out}")
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
+    p.add_argument("--seeds", nargs="+", type=int, default=list(range(20)))
     p.add_argument("--max-iter", type=int, default=50_000)
-    p.add_argument("--out", default="results/raissi_repro.json")
+    p.add_argument("--out", default="results/raissi/all.json")
+    p.add_argument("--summarize", action="store_true")
     a = p.parse_args()
-    main(a.seeds, a.max_iter, a.out)
+    if a.summarize:
+        summarize()
+    else:
+        main(a.seeds, a.max_iter, a.out)

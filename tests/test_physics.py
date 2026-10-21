@@ -100,6 +100,22 @@ def test_burgers_exact_satisfies_the_pde():
     assert np.abs(r).max() < 1e-5
 
 
+def test_burgers_exact_quadrature_has_converged():
+    """Halving the trapezoid step changes the solution only at roundoff level."""
+    x = np.linspace(-1, 1, 64)
+    t = np.array([0.1, 0.5, 1.0])
+    u, u2 = burgers_exact(x, t), burgers_exact(x, t, n_quad=16001)
+    assert np.abs(u - u2).max() < 1e-13
+
+
+def test_burgers_exact_matches_basdevant_max_slope():
+    """Basdevant et al. (1986): max |u_x(0, t)| = 152.00516 at t = 1.6037/pi."""
+    from scripts.reference_convergence import max_slope
+    slope, pi_t = max_slope()
+    assert abs(slope - 152.00516) < 1e-4
+    assert abs(pi_t - 1.6037) < 1e-4
+
+
 def test_chebyshev_reference_agrees_with_exact_solution():
     x, t, u_ref = burgers_reference(n=256, nt=11)
     u_ex = burgers_exact(x, t)

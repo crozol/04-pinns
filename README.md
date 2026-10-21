@@ -159,9 +159,24 @@ w(x, η, t) = exp( -cos(pi (x - η)) / (2 pi nu) - η² / (4 nu t) ).
 
 The integrals have no elementary closed form, but the Gaussian factor
 confines them to `|η| ≲ 12 √(4 nu t)`, and the trapezoid rule on 8001 nodes
-evaluates them to `~10⁻¹⁵` (`src/reference.py::burgers_exact`; the computed
-field satisfies the PDE with a finite-difference residual of `4 × 10⁻¹⁰`).
-Every Burgers error reported below is measured against this solution.
+evaluates them to roundoff (`src/reference.py::burgers_exact`). On the
+256 × 100 evaluation grid, against 16001 nodes (`scripts/reference_convergence.py`):
+
+| Nodes | Relative L2 change | Max. change |
+|---|---|---|
+| 1001 | 9.9 × 10⁻¹⁵ | 3.4 × 10⁻¹³ |
+| 2001 | 2.5 × 10⁻¹⁵ | 8.4 × 10⁻¹⁴ |
+| 4001 | 6.2 × 10⁻¹⁶ | 2.0 × 10⁻¹⁴ |
+| 8001 | 2.5 × 10⁻¹⁶ | 4.1 × 10⁻¹⁵ |
+
+Widening the window from 12 to 16 Gaussian widths changes the field by
+`2.6 × 10⁻¹⁶`. Two independent checks: the computed field satisfies the PDE
+with a finite-difference residual of `4 × 10⁻¹⁰`, and its maximum slope,
+`|u_x(0, t)| = 152.00516` at `t = 1.6037/pi` (from the same integrals
+differentiated under the integral sign), matches the value published by
+Basdevant et al. (1986) to all the digits they give. Every Burgers error
+reported below is measured against this solution; its own error, `~10⁻¹⁶`,
+is negligible next to any of them.
 
 ### 5.2 · A numerical cross-check — why finite differences failed
 
@@ -198,6 +213,18 @@ Compared with the exact solution, the spectral solution has a relative L2
 error of **0.40%** (maximum pointwise error 0.035, inside the internal layer).
 That is small in absolute terms but only a factor of ~5 below the PINN's own
 error, which is why the reported numbers now use the exact solution instead.
+The 0.40% is spatial under-resolution, not interpolation (the comparison is
+on the solver's own nodes): Gauss-Lobatto nodes cluster at the boundaries and
+are sparsest at `x = 0`, with spacing `≈ pi/N` — for `N = 256`, `0.0123`,
+about twice the width of the layer at its steepest (`1/152 ≈ 0.0066`). The
+largest error sits at the node next to `x = 0` at `t ≈ 0.52`, when the layer
+is steepest, and doubling `N` removes most of it:
+
+| N | Spacing at x = 0 | Relative L2 error | Max. error |
+|---|---|---|---|
+| 128 | 0.0245 | 2.06% | 0.11 |
+| 256 | 0.0123 | 0.40% | 0.035 |
+| 512 | 0.0061 | 0.013% | 0.0014 |
 The 8.8% and 1.92% figures in Sections 5.3–5.5 are from the original
 validation against this spectral solution and are labelled as such.
 
@@ -424,6 +451,7 @@ on Burgers, not a qualitative change in the conclusions above.
 │   ├── seed_sweep.py          # n=5 seed robustness check (mean +/- std relative L2 error)
 │   ├── heat_time_error.py     # heat error per time slice + figure
 │   ├── bc_weight_sweep.py     # Burgers sensitivity to the boundary weight λ_B
+│   ├── reference_convergence.py  # error floor of the Cole-Hopf reference + Chebyshev resolution
 │   └── raissi_repro.py        # Burgers with the original paper's recipe (L-BFGS, float64)
 ├── tests/                  # pytest: residual correctness, reference sanity, training smoke test
 └── figures/                 # PINN-vs-reference comparison plots + loss curve (tracked)

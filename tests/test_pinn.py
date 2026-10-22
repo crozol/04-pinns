@@ -36,3 +36,22 @@ def test_train_heat_smoke_loss_decreases():
     early = sum(history[:10]) / 10
     late = sum(history[-10:]) / 10
     assert late < early
+
+
+def test_validation_loss_is_the_unweighted_sum_on_a_fresh_grid():
+    """The selection criterion of scripts/bc_weight_sweep.py: finite terms
+    whose sum is the total, with the IC term sin² on a (numerically) zero model."""
+    import numpy as np
+    import torch
+
+    from scripts.bc_weight_sweep import validation_loss
+
+    class Zero(torch.nn.Module):          # cubic so that u_xx keeps a graph
+        def forward(self, x, t):
+            return 1e-20 * (x ** 3 + t)
+
+    v = validation_loss(Zero(), nx=21, nt=11)
+    assert np.isclose(v["total"], v["pde"] + v["bc"] + v["ic"])
+    assert v["pde"] < 1e-30 and v["bc"] < 1e-30
+    xi = np.linspace(-1, 1, 201)
+    assert np.isclose(v["ic"], np.mean(np.sin(np.pi * xi) ** 2), rtol=1e-5)

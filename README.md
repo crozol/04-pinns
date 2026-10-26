@@ -363,18 +363,39 @@ during training, and their relative scale shapes what the optimizer fits
 first (Wang, Teng & Perdikaris, 2021). The weight `λ_B = 2` used throughout
 was not tuned — it is what the original code did implicitly, summing the two
 per-edge means. `scripts/bc_weight_sweep.py` retrains the Burgers PINN (seed 0,
-full Adam + L-BFGS pipeline) for four values of `λ_B`:
+full Adam + L-BFGS pipeline) for four values of `λ_B` and chooses among them
+without the exact solution. On a fresh regular grid (201 × 101 interior
+points, 101 boundary times per edge, 201 initial points, none of them used in
+training) it computes the unweighted validation loss
+
+```
+V = mean r_PDE² + mean u(±1, t)² + mean (u(x, 0) + sin πx)²
+```
+
+with weight 1 on each term whatever `λ_B` was used in training, and selects
+the smallest:
 
 | `λ_B` | 0.5 | 1 | 2 (used) | 4 |
 |---|---|---|---|---|
-| relative L2 error vs. exact | 0.80% | 1.34% | 1.88% | 1.67% |
+| validation loss `V` | 1.90 × 10⁻⁴ | 3.27 × 10⁻⁴ | 4.53 × 10⁻⁴ | 3.35 × 10⁻⁴ |
+| relative L2 error vs. exact | 0.86% | 1.31% | 1.78% | 1.67% |
 
-Lower boundary weights help here, by more than a factor of two between
-`λ_B = 0.5` and `λ_B = 2`. Two caveats limit what this shows: it is a single
-seed, and the seed-to-seed spread at fixed `λ_B` (Section 7) is of the same
-order as some of these differences. The frozen configuration is left at
-`λ_B = 2`: choosing the weight by the same test error that is being reported
-would bias that error downward.
+The criterion selects `λ_B = 0.5`, whose error against the exact solution is
+**0.86%**, about half that of the untuned `λ_B = 2`. That error is reported
+once, after the choice; the other errors are shown for transparency, not for
+selection. `V` orders the four weights as the exact error does, so here the
+residual is a usable stand-in for the error. Two caveats limit what this
+shows: it is a single seed, and the seed-to-seed spread at fixed `λ_B`
+(Section 7) is of the same order as some of these differences; this run gives
+1.78% at `λ_B = 2`, the frozen run's value, where an earlier run of the same
+sweep gave 1.88% (training is not bit-for-bit reproducible, Section 10). The
+frozen configuration stays at the untuned `λ_B = 2`, so that every number
+before this section comes from the same setup.
+
+```bash
+python -m scripts.bc_weight_sweep --weights 0.5 --out results/bc_sweep/w0.5.json   # one process per weight
+python -m scripts.bc_weight_sweep --summarize                                      # select over results/bc_sweep/
+```
 
 ## 9 · Comparison with the original paper
 

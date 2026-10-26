@@ -23,6 +23,8 @@ are kept in the output for transparency, not for selection.
 
 Usage:
     python -m scripts.bc_weight_sweep                       # 0.5 1 2 4
+    python -m scripts.bc_weight_sweep --weights 2 --out results/bc_sweep/w2.json
+    python -m scripts.bc_weight_sweep --summarize           # select over results/bc_sweep/*.json
     python -m scripts.bc_weight_sweep --weights 1 --epochs 200 --lbfgs 20
 """
 
@@ -87,17 +89,42 @@ def main(weights: list[float], epochs: int, lbfgs: int, seed: int, out: str) -> 
                      "relative_l2_error_vs_exact": err, "seconds": time.time() - t0})
         print(f"  lambda_bc = {w:<4}  validation loss = {val['total']:.3e} "
               f"(pde {val['pde']:.2e}, bc {val['bc']:.2e}, ic {val['ic']:.2e})", flush=True)
-        best = min(runs, key=lambda r: r["validation_loss"]["total"])
-        Path(out).parent.mkdir(parents=True, exist_ok=True)
-        with open(out, "w") as fh:
-            json.dump({"seed": seed, "epochs": epochs, "lbfgs_iter": lbfgs,
-                       "selection": "smallest unweighted validation loss on a fresh grid",
-                       "selected": {"lambda_bc": best["lambda_bc"],
-                                    "relative_l2_error_vs_exact": best["relative_l2_error_vs_exact"]},
-                       "runs": runs}, fh, indent=2)
+        best = _write(out, seed, epochs, lbfgs, runs)
     print(f"  selected lambda_bc = {best['lambda_bc']} -> rel L2 vs exact "
           f"{best['relative_l2_error_vs_exact']:.4%}", flush=True)
     print(f"[ok] {out}")
+
+
+def _write(out: str, seed: int, epochs: int, lbfgs: int, runs: list[dict]) -> dict:
+    best = min(runs, key=lambda r: r["validation_loss"]["total"])
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w") as fh:
+        json.dump({"seed": seed, "epochs": epochs, "lbfgs_iter": lbfgs,
+                   "selection": "smallest unweighted validation loss on a fresh grid",
+                   "selected": {"lambda_bc": best["lambda_bc"],
+                                "relative_l2_error_vs_exact": best["relative_l2_error_vs_exact"]},
+                   "runs": runs}, fh, indent=2)
+    return best
+
+
+def summarize(pattern: str = "results/bc_sweep/*.json",
+              out: str = "results/bc_weight_sweep.json") -> dict:
+    """Select lambda_bc over weights trained in separate processes (one JSON each)."""
+    import glob
+
+    parts = [json.load(open(f)) for f in sorted(glob.glob(pattern))]
+    settings = {(d["seed"], d["epochs"], d["lbfgs_iter"]) for d in parts}
+    if len(settings) != 1:
+        raise SystemExit(f"expected one training setting in {pattern}, found {sorted(settings)}")
+    runs = sorted((r for d in parts for r in d["runs"]), key=lambda r: r["lambda_bc"])
+    best = _write(out, *settings.pop(), runs)
+    for r in runs:
+        print(f"  lambda_bc = {r['lambda_bc']:<4}  validation loss = "
+              f"{r['validation_loss']['total']:.3e}")
+    print(f"  selected lambda_bc = {best['lambda_bc']} -> rel L2 vs exact "
+          f"{best['relative_l2_error_vs_exact']:.4%}")
+    print(f"[ok] {out}")
+    return best
 
 
 if __name__ == "__main__":
@@ -108,5 +135,10 @@ if __name__ == "__main__":
     p.add_argument("--lbfgs", type=int, default=1000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default="results/bc_weight_sweep.json")
+    p.add_argument("--summarize", action="store_true",
+                   help="select over the per-weight runs in results/bc_sweep/*.json")
     a = p.parse_args()
-    main(a.weights, a.epochs, a.lbfgs, a.seed, a.out)
+    if a.summarize:
+        summarize()
+    else:
+        main(a.weights, a.epochs, a.lbfgs, a.seed, a.out)

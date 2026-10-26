@@ -55,3 +55,28 @@ def test_validation_loss_is_the_unweighted_sum_on_a_fresh_grid():
     assert v["pde"] < 1e-30 and v["bc"] < 1e-30
     xi = np.linspace(-1, 1, 201)
     assert np.isclose(v["ic"], np.mean(np.sin(np.pi * xi) ** 2), rtol=1e-5)
+
+
+def test_bc_weight_summary_selects_over_separate_runs(tmp_path):
+    """Weights trained in separate processes are selected together, by validation loss only."""
+    import json
+
+    import pytest
+
+    from scripts.bc_weight_sweep import summarize
+
+    def part(w, val, err, epochs=8000):
+        run = {"lambda_bc": w, "validation_loss": {"total": val},
+               "relative_l2_error_vs_exact": err, "seconds": 1.0}
+        (tmp_path / f"w{w}.json").write_text(json.dumps(
+            {"seed": 0, "epochs": epochs, "lbfgs_iter": 1000, "runs": [run]}))
+
+    part(0.5, 3e-4, 0.008)                # smallest exact error, not the smallest validation loss
+    part(2.0, 1e-4, 0.019)
+    out = tmp_path / "summary.json"
+    best = summarize(str(tmp_path / "w*.json"), str(out))
+    assert best["lambda_bc"] == 2.0
+    assert [r["lambda_bc"] for r in json.loads(out.read_text())["runs"]] == [0.5, 2.0]
+    part(4.0, 5e-5, 0.017, epochs=200)    # a run with other settings is not merged silently
+    with pytest.raises(SystemExit):
+        summarize(str(tmp_path / "w*.json"), str(out))

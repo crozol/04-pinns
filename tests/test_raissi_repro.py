@@ -67,7 +67,9 @@ def test_lbfgs_memory_test_reports_both_optimizers(tmp_path):
     from scripts import lbfgs_memory_test
 
     r = lbfgs_memory_test.main(seed=0, evals=8, out=str(tmp_path / "m.json"),
-                               options=dict(raissi_repro.AUTHORS_OPTIONS, maxiter=15), **SMALL)
+                               options=dict(raissi_repro.AUTHORS_OPTIONS, maxiter=15),
+                               out_fig=str(tmp_path / "m.png"), **SMALL)
+    assert (tmp_path / "m.png").stat().st_size > 0
     for name in ("torch", "lbfgsb"):
         assert r[name]["evals"] >= 8 and r[name]["iterations"] > 0
         assert r[name]["pairs_kept_by_lbfgsb_test"] <= r[name]["iterations"]

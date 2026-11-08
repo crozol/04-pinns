@@ -12,10 +12,13 @@
    reports the loss decrease per evaluation and the error against the exact solution before and
    after, i.e. what continuing past the recipe's stopping point is worth, and the loss against
    the number of evaluations for both (loss_curve: [evaluations, loss] at every accepted point).
+4. Plots both (figures/lbfgs_memory_test.png): the loss against evaluations, and y's at every
+   accepted step against torch's threshold 1e-10.
 
 Usage:
     python -m scripts.lbfgs_memory_test                    # seed 0, 600 evaluations each
     python -m scripts.lbfgs_memory_test --seed 3 --evals 1000
+    python -m scripts.lbfgs_memory_test --plot-only        # redraw the figure from the JSON
 """
 
 from __future__ import annotations
@@ -111,11 +114,53 @@ def report(name: str, pb: Problem, iterates: list, evals: int, curve: list,
             "pairs_kept_by_lbfgsb_test": int((ys > EPS * gs).sum()),
             "median_ys": float(np.median(ys)) if len(ys) else None,
             "median_ys_over_minus_gs": float(np.median(ys[pos] / gs[pos])) if pos.any() else None,
-            "loss_curve": [[int(e), float(v)] for e, v in curve]}
+            "loss_curve": [[int(e), float(v)] for e, v in curve],
+            "ys": ys.tolist(), "minus_gs": gs.tolist()}
+
+
+LABELS = {"torch": "torch.optim.LBFGS (earlier version)",
+          "lbfgsb": "SciPy L-BFGS-B (authors' optimizer)"}
+
+
+def plot(result: dict, out_fig: str = "figures/lbfgs_memory_test.png") -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2))
+    for name in ("torch", "lbfgsb"):
+        r = result[name]
+        e, f = np.array(r["loss_curve"]).T
+        ax1.plot(e, f, lw=2, label=f"{LABELS[name]}\nerror {r['error_start']:.2e} -> "
+                                     f"{r['error_end']:.2e}")
+        ys = np.array(r["ys"])
+        k = np.arange(1, len(ys) + 1)
+        ax2.semilogy(k[ys > 0], ys[ys > 0], ".", ms=3,
+                     label=f"{LABELS[name]}: torch keeps {r['pairs_kept_by_torch_test']}"
+                           f"/{r['iterations']}, L-BFGS-B keeps "
+                           f"{r['pairs_kept_by_lbfgsb_test']}/{r['iterations']}")
+    ax1.set_xlabel("loss evaluations after the recipe's stopping point")
+    ax1.set_ylabel("training loss")
+    ax1.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    ax1.legend(frameon=False, fontsize=8)
+    ax2.axhline(1e-10, color="grey", lw=1, ls="--")
+    ax2.text(0.02, 1.4e-10, "torch keeps a pair only above this line (y's > 1e-10)",
+             fontsize=8, color="grey", transform=ax2.get_yaxis_transform())
+    ax2.set_xlabel("accepted step")
+    ax2.set_ylabel("y's of the step")
+    ax2.legend(frameon=False, fontsize=8, loc="upper right")
+    fig.suptitle(f"Burgers, seed {result['seed']}: both optimizers from the point where the "
+                 f"float64 recipe stops (loss {result['start']['final_loss']:.2e})", fontsize=10)
+    fig.tight_layout()
+    Path(out_fig).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_fig, dpi=140)
+    plt.close(fig)
+    print(f"[ok] {out_fig}")
 
 
 def main(seed: int = 0, evals: int = 600, out: str = "results/lbfgs_memory_test.json",
-         options: dict | None = None, n_u: int = 100, n_f: int = 10_000) -> dict:
+         options: dict | None = None, n_u: int = 100, n_f: int = 10_000,
+         out_fig: str = "figures/lbfgs_memory_test.png") -> dict:
     pb = Problem(seed, "float64", n_u, n_f)
     start = run(seed, "float64", options=options, problem=pb)
     x0 = pb.get_x()
@@ -135,6 +180,7 @@ def main(seed: int = 0, evals: int = 600, out: str = "results/lbfgs_memory_test.
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text(json.dumps(result, indent=2))
     print(f"[ok] {out}")
+    plot(result, out_fig)
     return result
 
 
@@ -144,5 +190,10 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--evals", type=int, default=600)
     p.add_argument("--out", default="results/lbfgs_memory_test.json")
+    p.add_argument("--fig", default="figures/lbfgs_memory_test.png")
+    p.add_argument("--plot-only", action="store_true")
     a = p.parse_args()
-    main(a.seed, a.evals, a.out)
+    if a.plot_only:
+        plot(json.loads(Path(a.out).read_text()), a.fig)
+    else:
+        main(a.seed, a.evals, a.out, out_fig=a.fig)

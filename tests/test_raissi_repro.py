@@ -63,6 +63,18 @@ def test_main_skips_seeds_already_in_the_output(tmp_path, monkeypatch):
     assert [r["seed"] for r in json.loads(out.read_text())["runs"]] == [0, 1]
 
 
+def test_lbfgs_memory_test_reports_both_optimizers(tmp_path):
+    from scripts import lbfgs_memory_test
+
+    r = lbfgs_memory_test.main(seed=0, evals=8, out=str(tmp_path / "m.json"),
+                               options=dict(raissi_repro.AUTHORS_OPTIONS, maxiter=15), **SMALL)
+    for name in ("torch", "lbfgsb"):
+        assert r[name]["evals"] >= 8 and r[name]["iterations"] > 0
+        assert r[name]["pairs_kept_by_lbfgsb_test"] <= r[name]["iterations"]
+        assert r[name]["loss_end"] <= r[name]["loss_start"]
+    assert json.loads((tmp_path / "m.json").read_text())["seed"] == 0
+
+
 def _quadratic(scale: float, n: int = 50):
     a = np.linspace(1.0, 100.0, n)
     return lambda x: (0.5 * scale * float(a @ x**2), scale * a * x), np.ones(n)

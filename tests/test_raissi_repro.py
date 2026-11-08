@@ -72,6 +72,7 @@ def test_lbfgs_memory_test_reports_both_optimizers(tmp_path):
         assert r[name]["evals"] >= 8 and r[name]["iterations"] > 0
         assert r[name]["pairs_kept_by_lbfgsb_test"] <= r[name]["iterations"]
         assert r[name]["loss_end"] <= r[name]["loss_start"]
+        assert r[name]["loss_curve"][0] == [0, r[name]["loss_start"]]
     assert json.loads((tmp_path / "m.json").read_text())["seed"] == 0
 
 

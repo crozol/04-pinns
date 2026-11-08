@@ -10,7 +10,8 @@
 3. For every accepted step it computes s = x_{k+1} - x_k and y = g_{k+1} - g_k and counts the
    pairs each memory test keeps: torch's y's > 1e-10 and L-BFGS-B's y's > eps * (-g's). It also
    reports the loss decrease per evaluation and the error against the exact solution before and
-   after, i.e. what continuing past the recipe's stopping point is worth.
+   after, i.e. what continuing past the recipe's stopping point is worth, and the loss against
+   the number of evaluations for both (loss_curve: [evaluations, loss] at every accepted point).
 
 Usage:
     python -m scripts.lbfgs_memory_test                    # seed 0, 600 evaluations each
@@ -44,7 +45,7 @@ def torch_arm(pb: Problem, x0: np.ndarray, budget: int):
     opt = torch.optim.LBFGS(pb.params, lr=1.0, max_iter=1, max_eval=10**9,
                             tolerance_grad=1e-12, tolerance_change=EPS,
                             history_size=50, line_search_fn="strong_wolfe")
-    iterates, evals, first = [], [0], [True]
+    iterates, evals, first, curve = [], [0], [True], []
 
     def closure():
         opt.zero_grad()
@@ -52,6 +53,7 @@ def torch_arm(pb: Problem, x0: np.ndarray, budget: int):
         loss.backward()
         if first[0]:
             iterates.append((pb.get_x(), loss.item(), _flat_grad(pb)))
+            curve.append((evals[0], loss.item()))
             first[0] = False
         else:
             evals[0] += 1
@@ -62,33 +64,37 @@ def torch_arm(pb: Problem, x0: np.ndarray, budget: int):
         opt.step(closure)
     f, g = pb.value_and_grad(pb.get_x())
     iterates.append((pb.get_x(), f, g))
-    return iterates, evals[0]
+    curve.append((evals[0], f))
+    return iterates, evals[0], curve
 
 
 def lbfgsb_arm(pb: Problem, x0: np.ndarray, budget: int):
-    cache = {}
+    cache, calls = {}, [0]
 
     def fun(v):
         f, g = pb.value_and_grad(v)
         cache[v.tobytes()] = (v.copy(), f, g)
+        calls[0] += 1
         return f, g
 
     f0, g0 = pb.value_and_grad(x0)
-    iterates = [(x0.copy(), f0, g0)]
+    iterates, curve = [(x0.copy(), f0, g0)], [(0, f0)]
 
     def callback(intermediate_result):
         iterates.append(cache[intermediate_result.x.tobytes()])
+        curve.append((calls[0] - 1, iterates[-1][1]))     # the evaluation at x0 is not counted
 
     res = minimize(fun, x0, jac=True, method="L-BFGS-B", callback=callback,
                    options=dict(AUTHORS_OPTIONS, maxfun=budget + 1, gtol=0.0))
     pb.set_x(res.x)
     if not np.array_equal(iterates[-1][0], res.x):
         iterates.append((res.x.copy(),) + pb.value_and_grad(res.x))
-    return iterates, int(res.nfev) - 1                # the evaluation at x0 is not counted
+        curve.append((int(res.nfev) - 1, iterates[-1][1]))
+    return iterates, int(res.nfev) - 1, curve
 
 
-def report(name: str, pb: Problem, iterates: list, evals: int, error_start: float,
-           seconds: float) -> dict:
+def report(name: str, pb: Problem, iterates: list, evals: int, curve: list,
+           error_start: float, seconds: float) -> dict:
     ys, gs = [], []
     for (xa, _, ga), (xb, _, gb) in zip(iterates[:-1], iterates[1:]):
         s, y = xb - xa, gb - ga
@@ -104,7 +110,8 @@ def report(name: str, pb: Problem, iterates: list, evals: int, error_start: floa
             "pairs_kept_by_torch_test": int((ys > 1e-10).sum()),
             "pairs_kept_by_lbfgsb_test": int((ys > EPS * gs).sum()),
             "median_ys": float(np.median(ys)) if len(ys) else None,
-            "median_ys_over_minus_gs": float(np.median(ys[pos] / gs[pos])) if pos.any() else None}
+            "median_ys_over_minus_gs": float(np.median(ys[pos] / gs[pos])) if pos.any() else None,
+            "loss_curve": [[int(e), float(v)] for e, v in curve]}
 
 
 def main(seed: int = 0, evals: int = 600, out: str = "results/lbfgs_memory_test.json",
@@ -115,8 +122,9 @@ def main(seed: int = 0, evals: int = 600, out: str = "results/lbfgs_memory_test.
     result = {"seed": seed, "budget_evals": evals, "start": start}
     for name, arm in (("torch", torch_arm), ("lbfgsb", lbfgsb_arm)):
         t0 = time.time()
-        iterates, n = arm(pb, x0, evals)
-        result[name] = report(name, pb, iterates, n, start["relative_l2_error"], time.time() - t0)
+        iterates, n, curve = arm(pb, x0, evals)
+        result[name] = report(name, pb, iterates, n, curve, start["relative_l2_error"],
+                              time.time() - t0)
         r = result[name]
         print(f"{name:6s}: {r['iterations']} it / {r['evals']} evals; pairs kept "
               f"torch-test {r['pairs_kept_by_torch_test']}, L-BFGS-B-test "

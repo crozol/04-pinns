@@ -1,57 +1,125 @@
-"""Reproduce the Burgers setup of Raissi, Perdikaris & Karniadakis (2019), §3.1.
+"""Reproduce the Burgers result of Raissi, Perdikaris & Karniadakis (2019), §3.1, with the
+authors' optimizer, and measure how often the recipe reaches the published error.
 
-The paper reports a relative L2 error of 6.7e-4 for:
+What the authors ran
+--------------------
+The paper reports a relative L2 error of 6.7e-4. Its code
+(maziarraissi/PINNs, appendix/continuous_time_inference (Burgers)/Burgers.py, TensorFlow 1.x):
 
-* a tanh network with 8 hidden layers of 20 neurons (3 021 parameters).
-  The paper's "9 layers" counts the output layer: 8 hidden layers is the
-  only depth that gives the 3 021 parameters of the authors' code
-  (7 → 2 601, 9 → 3 441). An earlier version of this script used 9 hidden
-  layers; its three seeds are kept in results/raissi_repro_9hidden.json,
-* N_u = 100 initial/boundary points drawn from the t = 0 and x = ±1 edges,
-* N_f = 10 000 collocation points from a Latin hypercube,
-* loss = MSE_u + MSE_f, minimised by full-batch L-BFGS to convergence
-  (their TensorFlow code calls SciPy's L-BFGS-B with maxiter = 50 000).
+* a tanh network with 8 hidden layers of 20 neurons (3 021 parameters) in float32. The paper's
+  "9 layers" counts the output layer (7 hidden -> 2 601 parameters, 9 -> 3 441). The input is
+  mapped to [-1, 1] by H = 2 (X - lb) / (ub - lb) - 1;
+* Xavier weights from a truncated normal (TensorFlow cuts at two standard deviations), zero biases;
+* N_u = 100 initial/boundary points and N_f = 10 000 Latin-hypercube collocation points, to
+  which the N_u points are appended;
+* loss = MSE_u + MSE_f, minimised by SciPy's L-BFGS-B through TensorFlow's
+  ScipyOptimizerInterface with maxiter = maxfun = 50 000, maxcor = 50, maxls = 50, ftol = eps.
+  gtol is not set, so SciPy's default 1e-5 applies: TensorFlow passes the options through
+  unchanged and only casts the float32 gradient to float64, as L-BFGS-B requires.
 
-This script follows that recipe in float64 PyTorch and measures the error
-against the exact Cole-Hopf solution on the paper's 256 x 100 grid.
+This script runs the same optimizer (scipy.optimize.minimize, method L-BFGS-B) with the same
+options on a PyTorch network built the same way, and hands SciPy the loss and gradient as
+TensorFlow did.
 
-With 20 seeds the quantity reported is the failure rate — how many runs of
-the recipe stay above 10^-3 — rather than a median, because one run in three
-stalled in the first, 3-seed attempt. Each seed takes about 8 h on one CPU
-core; seeds are independent, so they are run as parallel processes, each
-writing its own JSON, and combined with --summarize.
+Why SciPy's L-BFGS-B and not torch.optim.LBFGS
+----------------------------------------------
+The question is how often the published recipe reaches the published error, so the optimizer,
+its stopping rule and the precision have to be the recipe's. An earlier version of this script
+used torch.optim.LBFGS in float64. In the regime this benchmark reaches it is a different
+algorithm, not the same one in another library:
 
-Every 200 L-BFGS iterations each seed saves its model and optimiser state to
-results/raissi/checkpoints/, so an interrupted process resumes where it stopped
-when the same command is launched again. The optimiser then runs in chunks of
-200 iterations that carry over the evaluation budget and apply the stopping
-tests of one uninterrupted call at every chunk boundary: a chunked or resumed
-run follows the same trajectory as a single opt.step(closure)
-(tests/test_raissi_repro.py).
+1. Memory. L-BFGS keeps a curvature pair (s, y) only if y's is safely positive. L-BFGS-B
+   (Byrd, Lu, Nocedal & Zhu, 1995) skips the pair when y's <= eps * (-g's), a test relative to
+   the step it was measured on. torch keeps it only when y's > 1e-10, an absolute threshold.
+   A strong-Wolfe line search already guarantees y's > 0, so the test only guards against
+   round-off, and an absolute threshold makes it depend on the units of the loss. With the
+   loss near 1e-6, y's falls near 1e-12: torch discards every pair although y's / (-g's) is
+   about 1, fifteen orders of magnitude above eps. Its memory freezes, and the method becomes
+   a fixed-metric descent that barely moves. scripts/lbfgs_memory_test.py measures this.
+2. Stopping. The recipe stops when max|g| <= 1e-5 or when an iteration lowers the loss by less
+   than eps * max(|f|, 1). torch's tests are different (tolerance_grad, and tolerance_change on
+   the loss and on the step), and the earlier version set them so low that every seed used its
+   full budget, far past the point where the recipe stops.
+3. Line search: Moré-Thuente in L-BFGS-B; in torch, a bracketing cubic search whose first step
+   is scaled by min(1, 1/|g|_1).
+
+Lowering torch's threshold fixes (1) only, and gives an optimizer that exists only in this
+project. The stopping rule matters as much as the memory: once the loss is near 1e-6, lowering
+it further does not lower the error against the exact solution, so where a run stops decides
+the number it reports (scripts/lbfgs_memory_test.py also measures this).
+
+Precision
+---------
+The recipe runs in float32, as the authors ran it, and again in float64 as a sensitivity check.
+The precision decides which test ends a run: near a loss of 1e-6, float32 cannot represent
+decreases much below 1e-13, so the relative-reduction test (ftol = eps) stops the run; in
+float64 it continues until max|g| <= 1e-5.
+
+Remaining differences from the authors' runs: PyTorch instead of TensorFlow (same arithmetic,
+different rounding), SciPy's C translation of L-BFGS-B 3.0 instead of the Fortran original
+(same update and stopping tests), initial/boundary values from the exact formulas instead of the
+authors' data file (the same values), and the seeds.
+
+The quantity reported is the failure rate over 20 seeds: how many runs stay above 1e-3. A seed
+takes about 10 min in float32 and 15 min in float64 on a laptop CPU; each process writes its
+own JSON (seeds already in it are skipped when a command is run again), and --summarize
+combines them per precision.
 
 Usage:
-    python -m scripts.raissi_repro --seeds 0 8 16 --out results/raissi/p0.json
-    python -m scripts.raissi_repro --summarize            # results/raissi/*.json
-    python -m scripts.raissi_repro --seeds 0 --max-iter 200 --out results/smoke.json
+    python -m scripts.raissi_repro --dtype float32 --seeds 0 1 2 --out results/raissi/float32/p0.json
+    python -m scripts.raissi_repro --summarize          # results/raissi/<dtype>/*.json
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
-import os
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.optimize import minimize
 from scipy.stats import qmc
+from torch import nn
 
 from src.physics import NU_BURGERS, burgers_residual
-from src.pinn import PINN
 from src.reference import burgers_exact
 
 LAYERS = (2,) + (20,) * 8 + (1,)
+LB, UB = (-1.0, 0.0), (1.0, 1.0)                  # (x, t) domain
+DTYPES = {"float32": torch.float32, "float64": torch.float64}
+# the authors' ScipyOptimizerInterface options; gtol is left to SciPy's default (1e-5), as they did
+AUTHORS_OPTIONS = {"maxiter": 50_000, "maxfun": 50_000, "maxcor": 50, "maxls": 50,
+                   "ftol": float(np.finfo(float).eps)}
+PAPER_ERROR = 6.7e-4
+THRESHOLD = 1e-3
+
+
+class RaissiNet(nn.Module):
+    """tanh network with the authors' input scaling H = 2 (X - lb) / (ub - lb) - 1."""
+
+    def __init__(self, layers: tuple[int, ...] = LAYERS):
+        super().__init__()
+        self.linears = nn.ModuleList(nn.Linear(a, b) for a, b in zip(layers[:-1], layers[1:]))
+        self.register_buffer("lb", torch.tensor(LB))
+        self.register_buffer("ub", torch.tensor(UB))
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        h = 2.0 * (torch.cat([x, t], dim=-1) - self.lb) / (self.ub - self.lb) - 1.0
+        for lin in self.linears[:-1]:
+            h = torch.tanh(lin(h))
+        return self.linears[-1](h)
+
+
+def xavier_truncated_(model: RaissiNet) -> None:
+    """tf.truncated_normal(stddev = sqrt(2 / (fan_in + fan_out))): redrawn beyond 2 std; zero biases."""
+    for lin in model.linears:
+        sd = float(np.sqrt(2.0 / (lin.in_features + lin.out_features)))
+        nn.init.trunc_normal_(lin.weight, std=sd, a=-2 * sd, b=2 * sd)
+        nn.init.zeros_(lin.bias)
 
 
 def training_points(n_u: int, n_f: int, seed: int):
@@ -72,152 +140,132 @@ def training_points(n_u: int, n_f: int, seed: int):
     return edge_xt[pick], edge_u[pick], xf
 
 
-def _save_checkpoint(path: Path, model, opt, progress: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    torch.save({"model": model.state_dict(), "optimizer": opt.state_dict(),
-                "progress": progress}, tmp)
-    os.replace(tmp, path)                             # never leave a half-written checkpoint
+class Problem:
+    """The recipe's network and loss for one seed, as a function of a flat float64 vector."""
 
+    def __init__(self, seed: int, dtype: str = "float32", n_u: int = 100, n_f: int = 10_000):
+        self.dtype = DTYPES[dtype]
+        torch.manual_seed(seed)
+        self.model = RaissiNet().to(self.dtype)
+        xavier_truncated_(self.model)
+        self.params = list(self.model.parameters())
+        xu, uu, xf = training_points(n_u, n_f, seed)
+        self.x_u, self.t_u, self.u_u = self._t(xu[:, :1]), self._t(xu[:, 1:]), self._t(uu[:, None])
+        self.x_f = self._t(xf[:, :1]).requires_grad_(True)
+        self.t_f = self._t(xf[:, 1:]).requires_grad_(True)
 
-def run(seed: int, max_iter: int, n_u: int = 100, n_f: int = 10_000,
-        checkpoint_dir: str | None = None, checkpoint_every: int = 200) -> dict:
-    torch.manual_seed(seed)
-    model = PINN(LAYERS).double()
-    for m in model.modules():                         # Xavier init, as in the paper's code
-        if isinstance(m, torch.nn.Linear):
-            torch.nn.init.xavier_normal_(m.weight)
-            torch.nn.init.zeros_(m.bias)
+    def _t(self, a) -> torch.Tensor:
+        return torch.tensor(a, dtype=self.dtype)
 
-    xu, uu, xf = training_points(n_u, n_f, seed)
-    T = lambda a: torch.tensor(a, dtype=torch.float64)          # noqa: E731
-    x_u, t_u, u_u = T(xu[:, :1]), T(xu[:, 1:]), T(uu[:, None])
-    x_f = T(xf[:, :1]).requires_grad_(True)
-    t_f = T(xf[:, 1:]).requires_grad_(True)
-
-    max_eval = int(1.25 * max_iter)
-    opt = torch.optim.LBFGS(
-        model.parameters(), lr=1.0, max_iter=max_iter, max_eval=max_eval,
-        tolerance_grad=1e-12, tolerance_change=np.finfo(float).eps,
-        history_size=50, line_search_fn="strong_wolfe",
-    )
-    # evals counts the evaluations as one uninterrupted opt.step(closure) would
-    progress = {"evals": 0, "seconds": 0.0, "final_loss": None, "done": False}
-    ckpt = Path(checkpoint_dir) / f"seed{seed}_iter{max_iter}.pt" if checkpoint_dir else None
-    if ckpt is not None and ckpt.exists():
-        saved = torch.load(ckpt, weights_only=False)  # our own file; the state holds a NumPy scalar
-        model.load_state_dict(saved["model"])
-        opt.load_state_dict(saved["optimizer"])
-        progress.update(saved["progress"])
-        print(f"  seed {seed}: resuming from {ckpt} ({progress['evals']} evals done)", flush=True)
-
-    def loss_fn():
-        loss_u = ((model(x_u, t_u) - u_u) ** 2).mean()
-        r = burgers_residual(model(x_f, t_f), x_f, t_f, nu=NU_BURGERS)
+    def loss(self) -> torch.Tensor:
+        loss_u = ((self.model(self.x_u, self.t_u) - self.u_u) ** 2).mean()
+        r = burgers_residual(self.model(self.x_f, self.t_f), self.x_f, self.t_f, nu=NU_BURGERS)
         return loss_u + (r ** 2).mean()
 
-    n_calls = [0]
+    def get_x(self) -> np.ndarray:
+        return torch.cat([p.detach().reshape(-1) for p in self.params]).double().numpy()
 
-    def closure():
-        opt.zero_grad()
-        loss = loss_fn()
+    def set_x(self, v: np.ndarray) -> None:
+        i = 0
+        with torch.no_grad():
+            for p in self.params:
+                n = p.numel()
+                p.copy_(torch.from_numpy(v[i:i + n]).view_as(p))     # cast to the network's dtype
+                i += n
+
+    def value_and_grad(self, v: np.ndarray) -> tuple[float, np.ndarray]:
+        self.set_x(v)
+        for p in self.params:
+            p.grad = None
+        loss = self.loss()
         loss.backward()
-        n_calls[0] += 1
-        progress["final_loss"] = loss.item()
-        return loss
+        g = torch.cat([p.grad.reshape(-1) for p in self.params]).numpy()
+        return float(loss.item()), g.astype(np.float64)              # as TensorFlow's wrapper
 
-    # L-BFGS in chunks of checkpoint_every iterations. Each chunk gets the evaluation budget
-    # that one uninterrupted call would have left (it also sets the line-search budget), and
-    # the stopping tests that call applies between iterations are applied at every chunk
-    # boundary, so the chunked run follows the same trajectory as a single opt.step(closure).
-    group = opt.param_groups[0]
-    state = opt.state[group["params"][0]]
-    t0 = time.time() - progress["seconds"]
-    while not progress["done"]:
-        it0, calls0 = state.get("n_iter", 0), n_calls[0]
-        group["max_iter"] = min(checkpoint_every, max_iter - it0)
-        group["max_eval"] = max_eval - max(progress["evals"] - 1, 0)
-        opt.step(closure)
-        # every chunk after the first starts by re-evaluating the point where the last one stopped
-        progress["evals"] += n_calls[0] - calls0 - (1 if progress["evals"] else 0)
-        it = state["n_iter"]
-        if it - it0 < group["max_iter"] or it >= max_iter or progress["evals"] >= max_eval:
-            progress["done"] = True
-        else:
-            opt.zero_grad()
-            loss = loss_fn()
-            loss.backward()
-            g = torch.cat([p.grad.reshape(-1) for p in model.parameters()])
-            progress["done"] = bool(
-                g.abs().max() <= group["tolerance_grad"]
-                or state["d"].mul(state["t"]).abs().max() <= group["tolerance_change"]
-                or abs(loss.item() - state["prev_loss"]) < group["tolerance_change"])
-        progress["seconds"] = time.time() - t0
-        if ckpt is not None:
-            _save_checkpoint(ckpt, model, opt, progress)
-
-    x = np.linspace(-1, 1, 256)
-    t = np.linspace(0, 1, 100)
-    X, Tt = np.meshgrid(x, t)
-    with torch.no_grad():
-        u = model(T(X.reshape(-1, 1)), T(Tt.reshape(-1, 1))).numpy().reshape(X.shape)
-    exact = burgers_exact(x, t)
-    err = float(np.linalg.norm(u - exact) / np.linalg.norm(exact))
-    print(f"  seed {seed}: rel L2 vs exact = {err:.3e}  final loss {progress['final_loss']:.3e}  "
-          f"{progress['evals']} evals  {progress['seconds']:.0f} s", flush=True)
-    return {"seed": seed, "relative_l2_error": err, "final_loss": progress["final_loss"],
-            "n_evals": progress["evals"], "seconds": progress["seconds"],
-            "n_params": sum(p.numel() for p in model.parameters())}
+    def relative_error(self) -> float:
+        x, t = np.linspace(-1, 1, 256), np.linspace(0, 1, 100)       # the paper's grid
+        X, T = np.meshgrid(x, t)
+        with torch.no_grad():
+            u = self.model(self._t(X.reshape(-1, 1)), self._t(T.reshape(-1, 1)))
+        u = u.double().numpy().reshape(X.shape)
+        exact = burgers_exact(x, t)
+        return float(np.linalg.norm(u - exact) / np.linalg.norm(exact))
 
 
-def main(seeds: list[int], max_iter: int, out: str, checkpoint_dir: str | None,
-         checkpoint_every: int) -> None:
-    runs = []
+def run(seed: int, dtype: str = "float32", n_u: int = 100, n_f: int = 10_000,
+        options: dict | None = None, problem: Problem | None = None) -> dict:
+    """One seed of the recipe: L-BFGS-B with the authors' options until one of its tests stops it."""
+    pb = problem or Problem(seed, dtype, n_u, n_f)
+    t0 = time.time()
+    res = minimize(pb.value_and_grad, pb.get_x(), jac=True, method="L-BFGS-B",
+                   options=AUTHORS_OPTIONS if options is None else options)
+    pb.set_x(res.x)
+    out = {"seed": seed, "dtype": dtype, "relative_l2_error": pb.relative_error(),
+           "final_loss": float(res.fun), "max_abs_grad": float(np.abs(res.jac).max()),
+           "n_iter": int(res.nit), "n_evals": int(res.nfev), "stop": str(res.message),
+           "seconds": time.time() - t0, "n_params": int(sum(p.numel() for p in pb.params))}
+    print(f"  seed {seed} [{dtype}]: rel L2 vs exact = {out['relative_l2_error']:.3e}  "
+          f"loss {out['final_loss']:.3e}  {out['n_iter']} it / {out['n_evals']} evals  "
+          f"{out['seconds']:.0f} s  ({out['stop']})", flush=True)
+    return out
+
+
+def main(seeds: list[int], dtype: str, out: str) -> None:
+    path = Path(out)
+    runs = json.loads(path.read_text())["runs"] if path.exists() else []
+    done = {r["seed"] for r in runs}
     for s in seeds:
-        runs.append(run(s, max_iter, checkpoint_dir=checkpoint_dir,
-                        checkpoint_every=checkpoint_every))
-        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        if s in done:
+            print(f"  seed {s} [{dtype}]: already in {out}, skipped", flush=True)
+            continue
+        runs.append(run(s, dtype))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"dtype": dtype, "options": AUTHORS_OPTIONS,
+                                    "paper_error": PAPER_ERROR, "runs": runs}, indent=2))
+    print(f"[ok] {out}")
+
+
+def summarize(root: str = "results/raissi", out: str = "results/raissi_repro.json",
+              threshold: float = THRESHOLD) -> dict:
+    summary = {"paper_error": PAPER_ERROR, "threshold": threshold, "options": AUTHORS_OPTIONS}
+    for dtype in DTYPES:
+        runs = {}
+        for f in sorted(glob.glob(str(Path(root) / dtype / "*.json"))):
+            for r in json.loads(Path(f).read_text())["runs"]:
+                runs[r["seed"]] = r
+        if not runs:
+            continue
+        runs = [runs[s] for s in sorted(runs)]
         errs = np.array([r["relative_l2_error"] for r in runs])
-        with open(out, "w") as fh:
-            json.dump({"max_iter": max_iter, "paper_error": 6.7e-4,
-                       "mean": float(errs.mean()),
-                       "std": float(errs.std(ddof=1)) if len(errs) > 1 else None,
-                       "runs": runs}, fh, indent=2)
+        fails = int((errs > threshold).sum())
+        summary[dtype] = {
+            "n_seeds": len(runs), "n_above_threshold": fails,
+            "median": float(np.median(errs)),
+            "quartiles": [float(np.quantile(errs, 0.25)), float(np.quantile(errs, 0.75))],
+            "min": float(errs.min()), "max": float(errs.max()),
+            "median_evals": float(np.median([r["n_evals"] for r in runs])),
+            "stops": dict(Counter(r["stop"] for r in runs)),
+            "n_params": runs[0]["n_params"], "runs": runs}
+        print(f"{dtype}: {len(runs)} seeds, {fails}/{len(runs)} above {threshold:g}; median "
+              f"{np.median(errs):.2e}, IQR [{np.quantile(errs, 0.25):.2e}, "
+              f"{np.quantile(errs, 0.75):.2e}], min {errs.min():.2e}, max {errs.max():.2e}")
+        for stop, n in Counter(r["stop"] for r in runs).items():
+            print(f"    {n:2d} stopped by: {stop}")
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    Path(out).write_text(json.dumps(summary, indent=2))
     print(f"[ok] {out}")
-
-
-def summarize(pattern: str = "results/raissi/*.json", out: str = "results/raissi_repro.json",
-              threshold: float = 1e-3) -> None:
-    import glob
-
-    runs = sorted((r for f in glob.glob(pattern) for r in json.load(open(f))["runs"]),
-                  key=lambda r: r["seed"])
-    errs = np.array([r["relative_l2_error"] for r in runs])
-    fails = int((errs > threshold).sum())
-    summary = {"n_seeds": len(runs), "paper_error": 6.7e-4, "threshold": threshold,
-               "n_above_threshold": fails, "median": float(np.median(errs)),
-               "quartiles": [float(np.quantile(errs, 0.25)), float(np.quantile(errs, 0.75))],
-               "min": float(errs.min()), "max": float(errs.max()),
-               "n_params": runs[0]["n_params"] if runs else None, "runs": runs}
-    with open(out, "w") as fh:
-        json.dump(summary, fh, indent=2)
-    print(f"{len(runs)} seeds: median {summary['median']:.3e}, IQR {summary['quartiles']}, "
-          f"{fails}/{len(runs)} above {threshold:g}; min {errs.min():.2e}, max {errs.max():.2e}")
-    print(f"[ok] {out}")
+    return summary
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--seeds", nargs="+", type=int, default=list(range(20)))
-    p.add_argument("--max-iter", type=int, default=50_000)
-    p.add_argument("--out", default="results/raissi/all.json")
-    p.add_argument("--checkpoint-dir", default="results/raissi/checkpoints",
-                   help="where each seed saves its model and L-BFGS state ('' to disable)")
-    p.add_argument("--checkpoint-every", type=int, default=200, help="L-BFGS iterations")
+    p.add_argument("--dtype", choices=list(DTYPES), default="float32")
+    p.add_argument("--out", default=None, help="default: results/raissi/<dtype>/all.json")
     p.add_argument("--summarize", action="store_true")
     a = p.parse_args()
     if a.summarize:
         summarize()
     else:
-        main(a.seeds, a.max_iter, a.out, a.checkpoint_dir or None, a.checkpoint_every)
+        main(a.seeds, a.dtype, a.out or f"results/raissi/{a.dtype}/all.json")

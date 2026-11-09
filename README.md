@@ -428,6 +428,10 @@ text of the paper:
 There is no Adam phase. `scripts/raissi_repro.py` builds the same network in PyTorch and calls
 the same optimizer with the same options.
 
+Every error in this section is measured against the Cole-Hopf solution on the paper's 256 × 100
+grid; that reference is converged to `2.5 × 10⁻¹⁶` (Section 5.1), twelve orders of magnitude
+below the smallest error reported here.
+
 ### 9.2 · First attempt: `torch.optim.LBFGS`, a second silent stall
 
 The first version of this reproduction followed the paper's text — read as 9 hidden layers

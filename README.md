@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](https://opensource.org/licenses/MIT)
 [![Portfolio page](https://img.shields.io/badge/Portfolio-page-7C3AED?style=flat-square)](https://crozol.github.io/projects/04-pinns.html)
 
-**TL;DR** — Two PDEs solved with physics-informed neural networks (Raissi, Perdikaris & Karniadakis, 2019): the loss combines the PDE residual, computed via automatic differentiation at collocation points, with the initial/boundary conditions — no mesh, no training data beyond those conditions. The 1D heat equation reaches **0.23% relative L2 error** against its closed-form solution (Adam + a short L-BFGS pass), but that is a global figure: the PINN's absolute error stays near `10⁻³` while the solution decays by `5 × 10⁻⁵`, so the relative error per time slice passes 10% after `t ≈ 0.6` (Section 4). The 1D viscous Burgers equation (`nu = 0.01/pi`, the classic benchmark with a thin internal layer at `x = 0`) is harder: Adam alone plateaus at **~8.8%**; L-BFGS fine-tuning on a fixed point batch brings it to **1.78%** against the exact Cole-Hopf solution. Getting there surfaced a silent failure mode of L-BFGS with resampled collocation points (Section 5.4). Across 5 seeds the errors are **0.14% ± 0.05%** (heat) and **1.66% ± 0.49%** (Burgers). The original paper reports 0.067% on Burgers; following its recipe (full-batch L-BFGS in float64) gives `7.1 × 10⁻⁴`, `1.15 × 10⁻³` and `2.2 × 10⁻²` on three seeds (Section 9), and the result is sensitive to the untuned boundary-loss weight (Section 8). Stack: PyTorch (autograd, `torch.optim.LBFGS`) · NumPy/SciPy (reference solutions) · Matplotlib.
+**TL;DR** — Two PDEs solved with physics-informed neural networks (Raissi, Perdikaris & Karniadakis, 2019): the loss combines the PDE residual, computed via automatic differentiation at collocation points, with the initial/boundary conditions — no mesh, no training data beyond those conditions. The 1D heat equation reaches **0.23% relative L2 error** against its closed-form solution (Adam + a short L-BFGS pass), but that is a global figure: the PINN's absolute error stays near `10⁻³` while the solution decays by `5 × 10⁻⁵`, so the relative error per time slice passes 10% after `t ≈ 0.6` (Section 4). The 1D viscous Burgers equation (`nu = 0.01/pi`, the classic benchmark with a thin internal layer at `x = 0`) is harder: Adam alone plateaus at **~8.8%**; L-BFGS fine-tuning on a fixed point batch brings it to **1.78%** against the exact Cole-Hopf solution. Getting there surfaced a silent failure mode of L-BFGS with resampled collocation points (Section 5.4). Across 5 seeds the errors are **0.14% ± 0.05%** (heat) and **1.66% ± 0.49%** (Burgers). The Burgers result is sensitive to the untuned boundary-loss weight (Section 8). The original paper reports 0.067% on Burgers. Its recipe as released — SciPy's L-BFGS-B with the authors' options, in float32 — stays above `10⁻³` on 18 of 20 seeds and never reaches that number; the same recipe in float64 reaches it on 8 of 20 (Section 9). Stack: PyTorch (autograd, `torch.optim.LBFGS`) · SciPy (L-BFGS-B for the paper's recipe, reference solutions) · NumPy · Matplotlib.
 
 The document walks through both cases in the order they were actually solved —
 including the point where the obvious approach quietly didn't work — rather
@@ -28,6 +28,11 @@ than only presenting the final, polished numbers.
 7. [Robustness: does it hold across seeds?](#7--robustness-does-it-hold-across-seeds)
 8. [Sensitivity to the boundary weight](#8--sensitivity-to-the-boundary-weight)
 9. [Comparison with the original paper](#9--comparison-with-the-original-paper)
+   - [9.1 · What the authors ran](#91--what-the-authors-ran)
+   - [9.2 · First attempt: `torch.optim.LBFGS`, a second silent stall](#92--first-attempt-torchoptimlbfgs-a-second-silent-stall)
+   - [9.3 · Why the authors' optimizer, and not a patched torch](#93--why-the-authors-optimizer-and-not-a-patched-torch)
+   - [9.4 · Result](#94--result)
+   - [9.5 · Remaining differences](#95--remaining-differences)
 10. [Reproducing](#10--reproducing)
 11. [File map](#11--file-map)
 12. [References](#12--references)
@@ -52,7 +57,7 @@ quadrature), with an independent Chebyshev-spectral solver as a cross-check.
 | `torch.optim.Adam` | First-order optimizer, resampled mini-batches every step |
 | `torch.optim.LBFGS` | Second-order fine-tuning, strong-Wolfe line search |
 | NumPy | Exact Cole-Hopf solution for Burgers (trapezoid quadrature) |
-| SciPy (`solve_ivp`, `qmc`) | Chebyshev-spectral cross-check for Burgers; Latin-hypercube sampling in the paper reproduction |
+| SciPy (`solve_ivp`, `qmc`, `optimize`) | Chebyshev-spectral cross-check for Burgers; Latin-hypercube sampling and L-BFGS-B in the paper reproduction |
 | Matplotlib | Static figures |
 
 No GPU is needed. Heat training takes a few minutes on a modern laptop CPU;
@@ -399,34 +404,128 @@ python -m scripts.bc_weight_sweep --summarize                                   
 
 ## 9 · Comparison with the original paper
 
-Raissi et al. (2019) report a relative L2 error of `6.7 × 10⁻⁴` (0.067%) on
-this benchmark, about 25 times lower than the 5-seed mean above. Their recipe
-differs in three ways: a deeper, narrower network (20 neurons per hidden
-layer), a fixed set of `N_u = 100` initial/boundary points and `N_f = 10 000`
-Latin-hypercube collocation points, and full-batch L-BFGS run to convergence
-(up to 50 000 iterations) with no Adam phase, in float64.
-`scripts/raissi_repro.py` follows that recipe and measures the result
-against the same exact solution, on the same 256 × 100 grid:
+Raissi et al. (2019) report a relative L2 error of `6.7 × 10⁻⁴` (0.067%) on this benchmark,
+about 25 times lower than the 5-seed mean above. This section measures how often their recipe
+reaches that number: the quantity reported is the failure rate over 20 seeds — how many runs
+stay above `10⁻³` — rather than a single run or a median.
 
-| seed | 0 | 1 | 2 |
-|---|---|---|---|
-| relative L2 error vs. exact | 2.2 × 10⁻² | 7.1 × 10⁻⁴ | 1.15 × 10⁻³ |
-| final loss | 3.3 × 10⁻⁶ | 1.2 × 10⁻⁶ | 1.4 × 10⁻⁶ |
+### 9.1 · What the authors ran
 
-One seed matches the published number, the median is `1.15 × 10⁻³`, and one
-seed stalls at 2.2%, no better than the much cheaper Adam + short L-BFGS
-pipeline. All three runs used their full evaluation budget (62 501 loss
-evaluations, ~8.3 h each on one CPU core) rather than stopping on a
-convergence tolerance. The published figure is therefore reproducible, but it
-is closer to a good draw than to a typical outcome of the recipe, and the
-gap between it and this project's pipeline (about 14× against the median) comes from the
-optimization budget and precision, not from a different formulation.
+The recipe is taken from the authors' released code
+(`appendix/continuous_time_inference (Burgers)/Burgers.py`, TensorFlow 1.x), not only from the
+text of the paper:
 
-Two deviations from the paper are known. The paper's text describes "9
-layers"; this reproduction uses 9 hidden layers (3 441 parameters), while the
-authors' released code uses 8 (3 021). The `N_u` points are drawn from the
-exact initial and boundary values rather than the authors' data file, which
-contains the same values.
+- a tanh network with 8 hidden layers of 20 neurons (3 021 parameters) in **float32** — the
+  paper's "9 layers" counts the output layer. The input `(x, t)` is mapped to `[−1, 1]²` before
+  the first layer, and the weights are Xavier draws from a truncated normal;
+- `N_u = 100` initial/boundary points and `N_f = 10 000` Latin-hypercube collocation points;
+- loss `MSE_u + MSE_f`, minimised by **SciPy's L-BFGS-B** through TensorFlow's
+  `ScipyOptimizerInterface` with `maxiter = maxfun = 50 000`, `maxcor = 50`, `maxls = 50` and
+  `ftol = ε`. The call does not set `gtol`, so SciPy's default applies: a run also stops when
+  the largest gradient component falls below `10⁻⁵`. TensorFlow passes these options through
+  unchanged and only casts the float32 gradient to float64.
+
+There is no Adam phase. `scripts/raissi_repro.py` builds the same network in PyTorch and calls
+the same optimizer with the same options.
+
+### 9.2 · First attempt: `torch.optim.LBFGS`, a second silent stall
+
+The first version of this reproduction followed the paper's text — read as 9 hidden layers
+(3 441 parameters), one more than the authors' code — with `torch.optim.LBFGS` in float64
+(history 50, strong-Wolfe line search, stopping tolerances set near zero so that the evaluation
+budget would decide). On three seeds it gave `7.1 × 10⁻⁴`, `1.15 × 10⁻³` and
+`2.2 × 10⁻²`, each run using its full budget of 62 501 loss evaluations (~8 h per seed).
+Extending it to 20 seeds exposed what those runs had been doing in their second half: checkpoints
+taken hours apart held the same curvature memory, and the optimizer had become a fixed-metric
+descent alternating between two step sizes and lowering the loss by about `10⁻¹²` per
+iteration.
+
+The cause is the test that decides whether a step's curvature pair `(s, y)` enters the memory.
+`torch.optim.LBFGS` keeps it only if `yᵀs > 10⁻¹⁰`, an absolute threshold. Near a loss of
+`10⁻⁶` the steps are small enough that `yᵀs` falls to about `10⁻¹²`, so every new pair is
+discarded, although each one is valid curvature information: `yᵀs / (−gᵀs)` stays close to 1,
+fifteen orders of magnitude above machine precision. As in Section 5.4, nothing reports the
+failure; the loss keeps decreasing, only about 400 times more slowly than under L-BFGS-B from
+the same point (table below).
+
+`scripts/lbfgs_memory_test.py` reproduces this from scratch: it runs the recipe in float64 until
+it stops, then gives both optimizers the same 600 loss evaluations from that point.
+
+| from the point where the recipe stops (loss `1.95 × 10⁻⁶`) | `torch.optim.LBFGS` | SciPy L-BFGS-B |
+|---|---|---|
+| pairs kept by torch's test, `yᵀs > 10⁻¹⁰` | 0 / 300 | 498 / 556 |
+| pairs kept by L-BFGS-B's test, `yᵀs > ε·(−gᵀs)` | 300 / 300 | 556 / 556 |
+| median `yᵀs / (−gᵀs)` | 1.00 | 0.61 |
+| loss decrease per evaluation | `9.3 × 10⁻¹³` | `3.6 × 10⁻¹⁰` |
+| relative L2 error against the exact solution | `1.56 × 10⁻²` → `1.56 × 10⁻²` | `1.56 × 10⁻²` → `1.72 × 10⁻²` |
+
+![torch.optim.LBFGS vs. SciPy L-BFGS-B from the recipe's stopping point](figures/lbfgs_memory_test.png)
+
+### 9.3 · Why the authors' optimizer, and not a patched torch
+
+Lowering torch's threshold removes the stall, but three reasons favour running the authors'
+optimizer instead:
+
+1. **The question is about the recipe.** A failure rate describes a procedure. If the
+   optimizer, its stopping rule or the precision differ from the authors', the rate belongs to
+   a different procedure and says nothing about the published number.
+2. **The memory test is not the only difference.** L-BFGS-B (Byrd, Lu, Nocedal & Zhu, 1995)
+   skips a pair when `yᵀs ≤ ε·(−gᵀs)`, a test relative to the step, so it does not depend on
+   the units of the loss: on a quadratic multiplied by `2⁻⁴⁰`, torch stores no pair and does not
+   progress, while L-BFGS-B stores the same pairs and reaches the same loss
+   (`tests/test_raissi_repro.py`). The two also differ in line search (Moré–Thuente vs. a
+   bracketing cubic search) and in their stopping tests. A patched torch would match neither
+   its own library nor the paper.
+3. **Where a run stops decides what it reports.** From the recipe's stopping point, the
+   optimizer that keeps working lowers the loss, but the error against the exact solution
+   rises, from `1.56 × 10⁻²` to `1.72 × 10⁻²`. At this level the training loss no longer tracks
+   the error, so the stopping rule (`gtol = 10⁻⁵`, `ftol = ε`) is part of the recipe — and the
+   torch runs, which kept going far past it, were measuring something else.
+
+### 9.4 · Result
+
+| | float32 (the authors' precision) | float64 |
+|---|---|---|
+| runs above `10⁻³` | **18 / 20** | 8 / 20 |
+| runs at or below the published `6.7 × 10⁻⁴` | 0 / 20 | 8 / 20 |
+| median relative L2 error [IQR] | `2.9 × 10⁻³` [`1.3 × 10⁻³`, `6.4 × 10⁻³`] | `9.7 × 10⁻⁴` [`5.4 × 10⁻⁴`, `1.8 × 10⁻³`] |
+| best / worst seed | `9.0 × 10⁻⁴` / `3.7 × 10⁻²` | `4.2 × 10⁻⁴` / `9.8 × 10⁻³` |
+| stopped by | relative reduction (`ftol`) in 20 of 20 | gradient (`gtol`) in 20 of 20 |
+| median loss evaluations | 5 465 of 50 000 | 7 459 of 50 000 |
+
+With the authors' optimizer, options and precision, no seed reaches the published `6.7 × 10⁻⁴`:
+the best, seed 2, is at `9.0 × 10⁻⁴`, and 18 of 20 stay above `10⁻³`. Every float32 run ends on
+the `ftol` test long before its budget, with the largest gradient component still above `gtol`
+(median `9 × 10⁻⁵`). That test is `(f_k − f_{k+1}) / max(|f_k|, |f_{k+1}|, 1) ≤ ε`; below a loss
+of 1 it asks for a decrease smaller than `ε ≈ 2.2 × 10⁻¹⁶`, which in float32 means a decrease the
+loss can no longer represent. A run therefore stops when float32 stops resolving its progress,
+not when it has converged, and a single such iteration is enough: seed 17 stops at a loss of
+`1.6 × 10⁻⁴`, twenty times the median, with an error of `1.1 × 10⁻²`. Across seeds a lower final
+loss goes with a lower error only loosely (Spearman ρ = 0.64).
+
+In float64 the same recipe runs until the gradient test is met, uses about a third more
+evaluations, and does better on 16 of 20 seeds: 8 runs reach the published error, and the
+published `6.7 × 10⁻⁴` lies inside the interquartile range. Seed 17, which float32 stopped early,
+reaches `6.3 × 10⁻⁴`. Even so, 8 runs stay above `10⁻³` and three end near `10⁻²`, with a final
+loss no different from the best ones: across the float64 seeds the final loss (`1.3`–`2.4 × 10⁻⁶`)
+does not order the errors at all (Spearman ρ = −0.14). Nothing the recipe computes separates a good
+run from a bad one.
+
+A seed takes about 10 min in float32 and 15–20 min in float64 on a laptop CPU, run alone.
+
+### 9.5 · Remaining differences
+
+PyTorch instead of TensorFlow (same arithmetic, different rounding and random streams); SciPy's
+C translation of L-BFGS-B 3.0 (SciPy ≥ 1.15) instead of the Fortran original, with the same
+update and stopping tests; initial and boundary values computed from the exact formulas instead
+of read from the authors' data file, which holds the same values; and the seeds.
+
+A single seed is reproducible only on the same arithmetic. Seed 0 in float64 gives
+`8.65 × 10⁻³` with two threads and `1.555 × 10⁻²` with four, each time to the last digit and the
+same iteration count: the thread count changes the order of floating-point reductions, and the
+run stops at a different point. The 20-seed runs use two threads per process; the comparison in
+Section 9.2 used four. A given seed is therefore not comparable with the authors' run of it or
+across machines — the distribution over 20 seeds is.
 
 ## 10 · Reproducing
 
@@ -437,7 +536,11 @@ pytest tests/ -v       # fast correctness checks (no full training run)
 
 python -m scripts.heat_time_error    # heat error resolved in time (reads results/)
 python -m scripts.bc_weight_sweep    # Section 8, ~1 h per weight on one core
-python -m scripts.raissi_repro       # Section 9, ~8 h per seed on one core
+python -m scripts.raissi_repro --dtype float32   # Section 9, 20 seeds, ~10 min per seed
+python -m scripts.raissi_repro --dtype float64   # ~15-20 min per seed
+python -m scripts.raissi_repro --summarize       # failure rates -> results/raissi_repro.json
+python -m scripts.lbfgs_memory_test              # Section 9.2 table and figure
+# per-seed numbers depend on the thread count (Section 9.5); the runs above used OMP_NUM_THREADS=2
 ```
 
 Training is not bit-for-bit reproducible between runs — collocation points
@@ -473,7 +576,8 @@ on Burgers, not a qualitative change in the conclusions above.
 │   ├── heat_time_error.py     # heat error per time slice + figure
 │   ├── bc_weight_sweep.py     # Burgers sensitivity to the boundary weight λ_B
 │   ├── reference_convergence.py  # error floor of the Cole-Hopf reference + Chebyshev resolution
-│   └── raissi_repro.py        # Burgers with the original paper's recipe (L-BFGS, float64)
+│   ├── raissi_repro.py        # Burgers with the original paper's recipe (SciPy L-BFGS-B, float32 + float64)
+│   └── lbfgs_memory_test.py   # torch.optim.LBFGS vs. L-BFGS-B from the recipe's stopping point
 ├── tests/                  # pytest: residual correctness, reference sanity, training smoke test
 └── figures/                 # PINN-vs-reference comparison plots + loss curve (tracked)
 ```
@@ -496,3 +600,14 @@ on Burgers, not a qualitative change in the conclusions above.
 - Liu, D. C. & Nocedal, J. (1989). *On the limited memory BFGS method for
   large scale optimization.* Mathematical Programming, 45, 503-528.
   (L-BFGS, used in the fine-tuning stage)
+- Byrd, R. H., Lu, P., Nocedal, J., & Zhu, C. (1995). *A limited memory
+  algorithm for bound constrained optimization.* SIAM Journal on Scientific
+  Computing, 16(5), 1190-1208. (L-BFGS-B, the optimizer of the paper's recipe,
+  Section 9)
+- Morales, J. L. & Nocedal, J. (2011). *Remark on "Algorithm 778: L-BFGS-B:
+  Fortran subroutines for large-scale bound constrained optimization".* ACM
+  Transactions on Mathematical Software, 38(1), 7. (L-BFGS-B 3.0, the version
+  SciPy implements)
+- Moré, J. J. & Thuente, D. J. (1994). *Line search algorithms with guaranteed
+  sufficient decrease.* ACM Transactions on Mathematical Software, 20(3),
+  286-307. (The line search of L-BFGS-B, Section 9.3)

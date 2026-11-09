@@ -142,18 +142,18 @@ def plot(result: dict, out_fig: str = "figures/lbfgs_memory_test.png") -> None:
     ax1.set_xlabel("loss evaluations after the recipe's stopping point")
     ax1.set_ylabel("training loss")
     ax1.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
-    ax1.legend(frameon=False, fontsize=8)
-    ax2.axhline(1e-10, color="grey", lw=1, ls="--")
-    ax2.text(0.02, 1.4e-10, "torch keeps a pair only above this line (y's > 1e-10)",
-             fontsize=8, color="grey", transform=ax2.get_yaxis_transform())
+    ax2.axhline(1e-10, color="grey", lw=1, ls="--",
+                label="torch's threshold: a pair is kept only if y's > 1e-10")
     ax2.set_xlabel("accepted step")
     ax2.set_ylabel("y's of the step")
-    ax2.legend(frameon=False, fontsize=8, loc="upper right")
+    # Legends go under the axes so they do not cover the data.
+    for ax in (ax1, ax2):
+        ax.legend(frameon=False, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.17))
     fig.suptitle(f"Burgers, seed {result['seed']}: both optimizers from the point where the "
                  f"float64 recipe stops (loss {result['start']['final_loss']:.2e})", fontsize=10)
     fig.tight_layout()
     Path(out_fig).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_fig, dpi=140)
+    fig.savefig(out_fig, dpi=140, bbox_inches="tight")
     plt.close(fig)
     print(f"[ok] {out_fig}")
 

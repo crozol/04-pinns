@@ -53,24 +53,27 @@ def evaluate(model, x: np.ndarray, t: np.ndarray, exact: np.ndarray) -> float:
 
 
 def validation_loss(model, nx: int = 201, nt: int = 101, chunk: int = 5000) -> dict:
-    """Unweighted residual + boundary + initial loss on a fresh regular grid."""
+    """Unweighted residual + boundary + initial loss on a fresh regular grid,
+    in the precision of the model's parameters."""
     model.eval()
+    p0 = next(iter(model.parameters()), None)
+    dt = p0.dtype if p0 is not None else torch.float32
     xs = np.linspace(-1, 1, nx + 2)[1:-1]
     ts = np.linspace(0, 1, nt + 2)[1:-1]
     X, T = np.meshgrid(xs, ts)
     xf, tf = X.reshape(-1, 1), T.reshape(-1, 1)
     sq = []
     for k in range(0, len(xf), chunk):
-        x = torch.tensor(xf[k:k + chunk], dtype=torch.float32, requires_grad=True)
-        t = torch.tensor(tf[k:k + chunk], dtype=torch.float32, requires_grad=True)
+        x = torch.tensor(xf[k:k + chunk], dtype=dt, requires_grad=True)
+        t = torch.tensor(tf[k:k + chunk], dtype=dt, requires_grad=True)
         r = burgers_residual(model(x, t), x, t, nu=NU_BURGERS)
         sq.append((r.detach() ** 2).numpy().ravel())
     pde = float(np.concatenate(sq).mean())
     with torch.no_grad():
-        tb = torch.linspace(0, 1, 101).reshape(-1, 1)
+        tb = torch.linspace(0, 1, 101, dtype=dt).reshape(-1, 1)
         bc = float(0.5 * ((model(-torch.ones_like(tb), tb) ** 2).mean()
                           + (model(torch.ones_like(tb), tb) ** 2).mean()))
-        xi = torch.linspace(-1, 1, 201).reshape(-1, 1)
+        xi = torch.linspace(-1, 1, 201, dtype=dt).reshape(-1, 1)
         ic = float(((model(xi, torch.zeros_like(xi)) + torch.sin(torch.pi * xi)) ** 2).mean())
     return {"pde": pde, "bc": bc, "ic": ic, "total": pde + bc + ic}
 

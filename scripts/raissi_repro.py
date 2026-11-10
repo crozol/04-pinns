@@ -9,6 +9,9 @@ The paper reports a relative L2 error of 6.7e-4. Its code
 * a tanh network with 8 hidden layers of 20 neurons (3 021 parameters) in float32. The paper's
   "9 layers" counts the output layer (7 hidden -> 2 601 parameters, 9 -> 3 441). The input is
   mapped to [-1, 1] by H = 2 (X - lb) / (ub - lb) - 1;
+* the domain is the bounding box of the data file's 256 x 100 grid, x in [-1, 1] and
+  t = 0, 0.01, ..., 0.99, so the boundary points, the collocation points, the normalisation
+  and the error grid stop at t = 0.99;
 * Xavier weights from a truncated normal (TensorFlow cuts at two standard deviations), zero biases;
 * N_u = 100 initial/boundary points and N_f = 10 000 Latin-hypercube collocation points, to
   which the N_u points are appended;
@@ -58,7 +61,8 @@ float64 it continues until max|g| <= 1e-5.
 Remaining differences from the authors' runs: PyTorch instead of TensorFlow (same arithmetic,
 different rounding), SciPy's C translation of L-BFGS-B 3.0 instead of the Fortran original
 (same update and stopping tests), initial/boundary values from the exact formulas instead of the
-authors' data file (the same values), and the seeds.
+authors' data file (the same values: the file's solution matches the Cole-Hopf one on its grid to
+a relative 3e-12), and the seeds.
 
 The quantity reported is the failure rate over 20 seeds: how many runs stay above 1e-3. A seed
 takes about 10 min in float32 and 15 min in float64 on a laptop CPU; each process writes its
@@ -88,8 +92,14 @@ from torch import nn
 from src.physics import NU_BURGERS, burgers_residual
 from src.reference import burgers_exact
 
+from scripts.bc_weight_sweep import validation_loss
+
 LAYERS = (2,) + (20,) * 8 + (1,)
-LB, UB = (-1.0, 0.0), (1.0, 1.0)                  # (x, t) domain
+# The authors' domain is the bounding box of their data grid (lb, ub = X_star.min(0),
+# X_star.max(0)), whose times are t = 0, 0.01, ..., 0.99: the input normalisation, the
+# collocation points, the boundary points and the error grid all stop at t = 0.99, not 1.
+T_END = 0.99
+LB, UB = (-1.0, 0.0), (1.0, T_END)                # (x, t) domain
 DTYPES = {"float32": torch.float32, "float64": torch.float64}
 # the authors' ScipyOptimizerInterface options; gtol is left to SciPy's default (1e-5), as they did
 AUTHORS_OPTIONS = {"maxiter": 50_000, "maxfun": 50_000, "maxcor": 50, "maxls": 50,
@@ -126,7 +136,7 @@ def training_points(n_u: int, n_f: int, seed: int):
     rng = np.random.default_rng(seed)
     # initial (t = 0) and boundary (x = ±1) edges, as in the paper's data file
     x_i = np.linspace(-1, 1, 256)
-    t_b = np.linspace(0, 1, 100)
+    t_b = np.linspace(0, T_END, 100)
     edge_xt = np.concatenate([
         np.stack([x_i, np.zeros_like(x_i)], 1),
         np.stack([-np.ones_like(t_b), t_b], 1),
@@ -135,7 +145,7 @@ def training_points(n_u: int, n_f: int, seed: int):
     edge_u = np.concatenate([-np.sin(np.pi * x_i), np.zeros_like(t_b), np.zeros_like(t_b)])
     pick = rng.choice(len(edge_xt), n_u, replace=False)
     lhs = qmc.LatinHypercube(d=2, seed=seed).random(n_f)
-    xf = qmc.scale(lhs, [-1, 0], [1, 1])
+    xf = qmc.scale(lhs, list(LB), list(UB))
     xf = np.concatenate([xf, edge_xt[pick]])        # the paper also adds X_u to X_f
     return edge_xt[pick], edge_u[pick], xf
 
@@ -183,7 +193,7 @@ class Problem:
         return float(loss.item()), g.astype(np.float64)              # as TensorFlow's wrapper
 
     def relative_error(self) -> float:
-        x, t = np.linspace(-1, 1, 256), np.linspace(0, 1, 100)       # the paper's grid
+        x, t = np.linspace(-1, 1, 256), np.linspace(0, T_END, 100)   # the paper's grid
         X, T = np.meshgrid(x, t)
         with torch.no_grad():
             u = self.model(self._t(X.reshape(-1, 1)), self._t(T.reshape(-1, 1)))
@@ -193,24 +203,32 @@ class Problem:
 
 
 def run(seed: int, dtype: str = "float32", n_u: int = 100, n_f: int = 10_000,
-        options: dict | None = None, problem: Problem | None = None) -> dict:
-    """One seed of the recipe: L-BFGS-B with the authors' options until one of its tests stops it."""
+        options: dict | None = None, problem: Problem | None = None,
+        params_dir: str | None = None) -> dict:
+    """One seed of the recipe: L-BFGS-B with the authors' options until one of its tests stops it.
+    Also scores the final network by the unweighted validation loss V of Section 8 (no exact
+    solution needed), and saves its parameters to ``params_dir`` if given."""
     pb = problem or Problem(seed, dtype, n_u, n_f)
     t0 = time.time()
     res = minimize(pb.value_and_grad, pb.get_x(), jac=True, method="L-BFGS-B",
                    options=AUTHORS_OPTIONS if options is None else options)
     pb.set_x(res.x)
+    seconds = time.time() - t0
+    if params_dir:
+        Path(params_dir).mkdir(parents=True, exist_ok=True)
+        np.save(Path(params_dir) / f"seed{seed:02d}.npy", res.x)
     out = {"seed": seed, "dtype": dtype, "relative_l2_error": pb.relative_error(),
+           "validation_loss": validation_loss(pb.model),
            "final_loss": float(res.fun), "max_abs_grad": float(np.abs(res.jac).max()),
            "n_iter": int(res.nit), "n_evals": int(res.nfev), "stop": str(res.message),
-           "seconds": time.time() - t0, "n_params": int(sum(p.numel() for p in pb.params))}
+           "seconds": seconds, "n_params": int(sum(p.numel() for p in pb.params))}
     print(f"  seed {seed} [{dtype}]: rel L2 vs exact = {out['relative_l2_error']:.3e}  "
           f"loss {out['final_loss']:.3e}  {out['n_iter']} it / {out['n_evals']} evals  "
           f"{out['seconds']:.0f} s  ({out['stop']})", flush=True)
     return out
 
 
-def main(seeds: list[int], dtype: str, out: str) -> None:
+def main(seeds: list[int], dtype: str, out: str, params_dir: str | None = None) -> None:
     path = Path(out)
     runs = json.loads(path.read_text())["runs"] if path.exists() else []
     done = {r["seed"] for r in runs}
@@ -218,7 +236,7 @@ def main(seeds: list[int], dtype: str, out: str) -> None:
         if s in done:
             print(f"  seed {s} [{dtype}]: already in {out}, skipped", flush=True)
             continue
-        runs.append(run(s, dtype))
+        runs.append(run(s, dtype, params_dir=params_dir))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"dtype": dtype, "options": AUTHORS_OPTIONS,
                                     "paper_error": PAPER_ERROR, "runs": runs}, indent=2))
@@ -246,6 +264,13 @@ def summarize(root: str = "results/raissi", out: str = "results/raissi_repro.jso
             "median_evals": float(np.median([r["n_evals"] for r in runs])),
             "stops": dict(Counter(r["stop"] for r in runs)),
             "n_params": runs[0]["n_params"], "runs": runs}
+        if all("validation_loss" in r for r in runs):
+            from scipy.stats import spearmanr
+            v = np.array([r["validation_loss"]["total"] for r in runs])
+            rho = float(spearmanr(v, errs).statistic)
+            summary[dtype]["spearman_validation_loss_vs_error"] = rho
+            print(f"    Spearman(V, error) = {rho:+.2f}; the seed with the lowest V has error "
+                  f"{errs[np.argmin(v)]:.2e} (rank {int((errs < errs[np.argmin(v)]).sum()) + 1} of {len(runs)})")
         print(f"{dtype}: {len(runs)} seeds, {fails}/{len(runs)} above {threshold:g}; median "
               f"{np.median(errs):.2e}, IQR [{np.quantile(errs, 0.25):.2e}, "
               f"{np.quantile(errs, 0.75):.2e}], min {errs.min():.2e}, max {errs.max():.2e}")
@@ -263,9 +288,12 @@ if __name__ == "__main__":
     p.add_argument("--seeds", nargs="+", type=int, default=list(range(20)))
     p.add_argument("--dtype", choices=list(DTYPES), default="float32")
     p.add_argument("--out", default=None, help="default: results/raissi/<dtype>/all.json")
+    p.add_argument("--params-dir", default=None, help="save each seed's final parameters here")
     p.add_argument("--summarize", action="store_true")
+    p.add_argument("--root", default="results/raissi", help="--summarize: folder with <dtype>/*.json")
+    p.add_argument("--summary-out", default="results/raissi_repro.json")
     a = p.parse_args()
     if a.summarize:
-        summarize()
+        summarize(a.root, a.summary_out)
     else:
-        main(a.seeds, a.dtype, a.out or f"results/raissi/{a.dtype}/all.json")
+        main(a.seeds, a.dtype, a.out or f"results/raissi/{a.dtype}/all.json", a.params_dir)

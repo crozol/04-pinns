@@ -33,8 +33,12 @@ def test_network_matches_the_authors_code():
     assert sum(p.numel() for p in net.parameters()) == 3_021
     seen = []
     net.linears[0].register_forward_pre_hook(lambda m, inp: seen.append(inp[0]))
-    net(torch.tensor([[-1.0], [1.0]]), torch.tensor([[0.0], [1.0]]))
+    net(torch.tensor([[-1.0], [1.0]]), torch.tensor([[0.0], [0.99]]))
     assert torch.allclose(seen[0], torch.tensor([[-1.0, -1.0], [1.0, 1.0]]))   # domain -> [-1, 1]
+    # the authors' domain is their data grid's bounding box: t = 0, 0.01, ..., 0.99
+    assert raissi_repro.UB == (1.0, 0.99)
+    xu, _, xf = raissi_repro.training_points(100, 1_000, seed=0)
+    assert xu[:, 1].max() <= 0.99 and xf[:, 1].max() <= 0.99
     raissi_repro.xavier_truncated_(net)
     for lin in net.linears:
         sd = np.sqrt(2.0 / (lin.in_features + lin.out_features))
@@ -42,20 +46,26 @@ def test_network_matches_the_authors_code():
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
-def test_run_trains_in_the_requested_precision(dtype):
+def test_run_trains_in_the_requested_precision(dtype, tmp_path):
     pb = raissi_repro.Problem(0, dtype, **SMALL)
     assert all(p.dtype == raissi_repro.DTYPES[dtype] for p in pb.params)
     f, g = pb.value_and_grad(pb.get_x())
     assert g.dtype == np.float64                         # what L-BFGS-B receives
     r = raissi_repro.run(0, dtype, options=dict(raissi_repro.AUTHORS_OPTIONS, maxiter=20),
-                         problem=pb)
+                         problem=pb, params_dir=str(tmp_path))
     assert r["dtype"] == dtype and r["final_loss"] < f and r["n_params"] == 3_021
+    v = r["validation_loss"]                             # Section 8's V, in the run's precision
+    assert np.isclose(v["total"], v["pde"] + v["bc"] + v["ic"]) and v["total"] > 0
+    saved = np.load(tmp_path / "seed00.npy")             # the optimizer's final vector
+    pb2 = raissi_repro.Problem(1, dtype, **SMALL)
+    pb2.set_x(saved)                                     # reloads the same network
+    assert np.array_equal(pb2.get_x(), pb.get_x())
 
 
 def test_main_skips_seeds_already_in_the_output(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(raissi_repro, "run",
-                        lambda s, dtype: calls.append(s) or {"seed": s, "relative_l2_error": 1.0})
+                        lambda s, dtype, params_dir=None: calls.append(s) or {"seed": s, "relative_l2_error": 1.0})
     out = tmp_path / "p.json"
     raissi_repro.main([0], "float32", str(out))
     raissi_repro.main([0, 1], "float32", str(out))

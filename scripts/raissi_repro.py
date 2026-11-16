@@ -36,9 +36,12 @@ algorithm, not the same one in another library:
    the step it was measured on. torch keeps it only when y's > 1e-10, an absolute threshold.
    A strong-Wolfe line search already guarantees y's > 0, so the test only guards against
    round-off, and an absolute threshold makes it depend on the units of the loss. With the
-   loss near 1e-6, y's falls near 1e-12: torch discards every pair although y's / (-g's) is
-   about 1, fifteen orders of magnitude above eps. Its memory freezes, and the method becomes
-   a fixed-metric descent that barely moves. scripts/lbfgs_memory_test.py measures this.
+   loss near 1e-6 the steps become small enough that y's falls below 1e-10, to 1e-11-1e-12:
+   torch then discards every pair although y's / (-g's) is about 1, fifteen orders of
+   magnitude above eps. Its memory freezes for good (without new pairs the steps stay small),
+   and the method becomes a fixed-metric descent that barely moves.
+   scripts/lbfgs_memory_test.py measures where the memory freezes and how much slower the
+   descent becomes.
 2. Stopping. The recipe stops when max|g| <= 1e-5 or when an iteration lowers the loss by less
    than eps * max(|f|, 1). torch's tests are different (tolerance_grad, and tolerance_change on
    the loss and on the step), and the earlier version set them so low that every seed used its
@@ -47,9 +50,9 @@ algorithm, not the same one in another library:
    is scaled by min(1, 1/|g|_1).
 
 Lowering torch's threshold fixes (1) only, and gives an optimizer that exists only in this
-project. The stopping rule matters as much as the memory: once the loss is near 1e-6, lowering
-it further does not lower the error against the exact solution, so where a run stops decides
-the number it reports (scripts/lbfgs_memory_test.py also measures this).
+project. The stopping rule matters as much as the memory: once the loss is near 1e-6 it no
+longer ranks the errors across seeds (--summarize reports the Spearman correlation), so where a
+run stops decides the number it reports.
 
 Precision
 ---------
@@ -69,8 +72,20 @@ takes about 10 min in float32 and 15 min in float64 on a laptop CPU; each proces
 own JSON (seeds already in it are skipped when a command is run again), and --summarize
 combines them per precision.
 
+Telling a good run from a bad one
+---------------------------------
+Each run also records the unweighted validation loss V of scripts/bc_weight_sweep.py on a fresh
+regular grid over the authors' domain (t <= 0.99), which needs no exact solution, and saves its
+final parameters (params/ next to its JSON). --summarize reports exact (Clopper-Pearson) 95%
+intervals for the rates, the Spearman correlation of V and of the final training loss with the
+error, and the rule "keep the run with the lowest V among k seeds", evaluated over every set of
+k runs (an enumeration, not a sample). --rescore recomputes V from the saved parameters, for
+runs scored before V was computed on the authors' domain, and checks that each saved network
+reproduces its stored error.
+
 Usage:
     python -m scripts.raissi_repro --dtype float32 --seeds 0 1 2 --out results/raissi/float32/p0.json
+    python -m scripts.raissi_repro --rescore            # V from the saved parameters
     python -m scripts.raissi_repro --summarize          # results/raissi/<dtype>/*.json
 """
 
@@ -206,8 +221,9 @@ def run(seed: int, dtype: str = "float32", n_u: int = 100, n_f: int = 10_000,
         options: dict | None = None, problem: Problem | None = None,
         params_dir: str | None = None) -> dict:
     """One seed of the recipe: L-BFGS-B with the authors' options until one of its tests stops it.
-    Also scores the final network by the unweighted validation loss V of Section 8 (no exact
-    solution needed), and saves its parameters to ``params_dir`` if given."""
+    Also scores the final network by the unweighted validation loss V of Section 8 on the authors'
+    domain, t <= 0.99 (no exact solution needed), and saves its parameters to ``params_dir`` if
+    given."""
     pb = problem or Problem(seed, dtype, n_u, n_f)
     t0 = time.time()
     res = minimize(pb.value_and_grad, pb.get_x(), jac=True, method="L-BFGS-B",
@@ -218,7 +234,7 @@ def run(seed: int, dtype: str = "float32", n_u: int = 100, n_f: int = 10_000,
         Path(params_dir).mkdir(parents=True, exist_ok=True)
         np.save(Path(params_dir) / f"seed{seed:02d}.npy", res.x)
     out = {"seed": seed, "dtype": dtype, "relative_l2_error": pb.relative_error(),
-           "validation_loss": validation_loss(pb.model),
+           "validation_loss": validation_loss(pb.model, t_end=T_END), "validation_t_end": T_END,
            "final_loss": float(res.fun), "max_abs_grad": float(np.abs(res.jac).max()),
            "n_iter": int(res.nit), "n_evals": int(res.nfev), "stop": str(res.message),
            "seconds": seconds, "n_params": int(sum(p.numel() for p in pb.params))}
@@ -229,7 +245,10 @@ def run(seed: int, dtype: str = "float32", n_u: int = 100, n_f: int = 10_000,
 
 
 def main(seeds: list[int], dtype: str, out: str, params_dir: str | None = None) -> None:
+    """Run the seeds not yet in ``out``; each run's final parameters go to ``params_dir``
+    (default: params/ next to ``out``), where --rescore finds them."""
     path = Path(out)
+    params_dir = params_dir or str(path.parent / "params")
     runs = json.loads(path.read_text())["runs"] if path.exists() else []
     done = {r["seed"] for r in runs}
     for s in seeds:
@@ -243,9 +262,57 @@ def main(seeds: list[int], dtype: str, out: str, params_dir: str | None = None) 
     print(f"[ok] {out}")
 
 
-def summarize(root: str = "results/raissi", out: str = "results/raissi_repro.json",
+def clopper_pearson(k: int, n: int, alpha: float = 0.05) -> list[float]:
+    """Exact two-sided (Clopper-Pearson) confidence interval for a binomial rate k / n."""
+    from scipy.stats import beta
+    lo = 0.0 if k == 0 else float(beta.ppf(alpha / 2, k, n - k + 1))
+    hi = 1.0 if k == n else float(beta.ppf(1 - alpha / 2, k + 1, n - k))
+    return [lo, hi]
+
+
+def best_of_k(errors, scores, k: int, paper: float = PAPER_ERROR,
               threshold: float = THRESHOLD) -> dict:
-    summary = {"paper_error": PAPER_ERROR, "threshold": threshold, "options": AUTHORS_OPTIONS}
+    """In every set of k runs, keep the one with the lowest score (no exact solution needed) and
+    describe the error of the kept run over all C(n, k) sets: an exact enumeration, not a sample."""
+    from itertools import combinations
+    errors, scores = np.asarray(errors, dtype=float), np.asarray(scores, dtype=float)
+    picks = np.array([errors[min(c, key=lambda i: scores[i])]
+                      for c in combinations(range(len(errors)), k)])
+    return {"k": k, "n_sets": int(len(picks)), "median": float(np.median(picks)),
+            "share_at_or_below_paper": float(np.mean(picks <= paper)),
+            "share_above_threshold": float(np.mean(picks > threshold))}
+
+
+def rescore(root: str = "results/raissi") -> None:
+    """Recompute V on the authors' domain for every run in <root>/<dtype>/*.json, from the
+    parameters saved in <root>/<dtype>/params/seedNN.npy, and check that each saved network
+    reproduces the stored error (to rounding: the thread count can change the last digits)."""
+    for dtype in DTYPES:
+        for f in sorted(glob.glob(str(Path(root) / dtype / "*.json"))):
+            data = json.loads(Path(f).read_text())
+            for r in data["runs"]:
+                pb = Problem(r["seed"], dtype)
+                pb.set_x(np.load(Path(root) / dtype / "params" / f"seed{r['seed']:02d}.npy"))
+                err = pb.relative_error()
+                dev = abs(err - r["relative_l2_error"]) / r["relative_l2_error"]
+                if dev > 1e-5:
+                    raise ValueError(f"{f}, seed {r['seed']}: the saved network gives error "
+                                     f"{err:.6e}, the run recorded {r['relative_l2_error']:.6e}")
+                old = r.get("validation_loss", {}).get("total")
+                r["validation_loss"] = validation_loss(pb.model, t_end=T_END)
+                r["validation_t_end"] = T_END
+                print(f"  {dtype} seed {r['seed']:2d}: error reproduced (rel. dev. {dev:.1e}); V "
+                      f"{old if old is None else f'{old:.4e}'} -> {r['validation_loss']['total']:.4e}",
+                      flush=True)
+            Path(f).write_text(json.dumps(data, indent=2))
+    print(f"[ok] V on t <= {T_END} for the runs in {root}")
+
+
+def summarize(root: str = "results/raissi", out: str = "results/raissi_repro.json",
+              threshold: float = THRESHOLD, ks: tuple[int, ...] = (3, 5)) -> dict:
+    from scipy.stats import spearmanr
+    summary = {"paper_error": PAPER_ERROR, "threshold": threshold, "options": AUTHORS_OPTIONS,
+               "intervals": "Clopper-Pearson, 95%"}
     for dtype in DTYPES:
         runs = {}
         for f in sorted(glob.glob(str(Path(root) / dtype / "*.json"))):
@@ -254,28 +321,70 @@ def summarize(root: str = "results/raissi", out: str = "results/raissi_repro.jso
         if not runs:
             continue
         runs = [runs[s] for s in sorted(runs)]
+        n = len(runs)
         errs = np.array([r["relative_l2_error"] for r in runs])
         fails = int((errs > threshold).sum())
-        summary[dtype] = {
-            "n_seeds": len(runs), "n_above_threshold": fails,
+        hits = int((errs <= PAPER_ERROR).sum())
+        loss = np.array([r["final_loss"] for r in runs])
+        stops = Counter(r["stop"] for r in runs)
+        rho_l = spearmanr(loss, errs)
+        s = summary[dtype] = {
+            "n_seeds": n, "n_above_threshold": fails,
+            "ci95_above_threshold": clopper_pearson(fails, n),
+            "n_at_or_below_paper": hits, "ci95_at_or_below_paper": clopper_pearson(hits, n),
             "median": float(np.median(errs)),
             "quartiles": [float(np.quantile(errs, 0.25)), float(np.quantile(errs, 0.75))],
-            "min": float(errs.min()), "max": float(errs.max()),
+            "min": float(errs.min()), "best_seed": runs[int(np.argmin(errs))]["seed"],
+            "max": float(errs.max()), "worst_seed": runs[int(np.argmax(errs))]["seed"],
             "median_evals": float(np.median([r["n_evals"] for r in runs])),
-            "stops": dict(Counter(r["stop"] for r in runs)),
+            "stops": dict(stops),
+            "median_max_abs_grad_by_stop": {
+                stop: float(np.median([r["max_abs_grad"] for r in runs if r["stop"] == stop]))
+                for stop in stops},
+            "final_loss_range": [float(loss.min()), float(loss.max())],
+            "spearman_final_loss_vs_error": {"rho": float(rho_l.statistic),
+                                             "p": float(rho_l.pvalue)},
+            "single_run": {"median": float(np.median(errs)), "share_at_or_below_paper": hits / n,
+                           "share_above_threshold": fails / n},
             "n_params": runs[0]["n_params"], "runs": runs}
+        print(f"{dtype}: {n} seeds, {fails}/{n} above {threshold:g} (95% CI "
+              f"{s['ci95_above_threshold'][0]:.3f}-{s['ci95_above_threshold'][1]:.3f}), {hits}/{n} at "
+              f"or below {PAPER_ERROR:g} (95% CI {s['ci95_at_or_below_paper'][0]:.3f}-"
+              f"{s['ci95_at_or_below_paper'][1]:.3f}); median {np.median(errs):.2e}, IQR "
+              f"[{np.quantile(errs, 0.25):.2e}, {np.quantile(errs, 0.75):.2e}], min {errs.min():.2e} "
+              f"(seed {s['best_seed']}), max {errs.max():.2e} (seed {s['worst_seed']})")
+        for stop, k in stops.items():
+            print(f"    {k:2d} stopped by: {stop} (median max|g| "
+                  f"{s['median_max_abs_grad_by_stop'][stop]:.1e})")
+        print(f"    final loss {loss.min():.2e}-{loss.max():.2e}; Spearman(final loss, error) = "
+              f"{rho_l.statistic:+.2f} (p = {rho_l.pvalue:.3f})")
         if all("validation_loss" in r for r in runs):
-            from scipy.stats import spearmanr
             v = np.array([r["validation_loss"]["total"] for r in runs])
-            rho = float(spearmanr(v, errs).statistic)
-            summary[dtype]["spearman_validation_loss_vs_error"] = rho
-            print(f"    Spearman(V, error) = {rho:+.2f}; the seed with the lowest V has error "
-                  f"{errs[np.argmin(v)]:.2e} (rank {int((errs < errs[np.argmin(v)]).sum()) + 1} of {len(runs)})")
-        print(f"{dtype}: {len(runs)} seeds, {fails}/{len(runs)} above {threshold:g}; median "
-              f"{np.median(errs):.2e}, IQR [{np.quantile(errs, 0.25):.2e}, "
-              f"{np.quantile(errs, 0.75):.2e}], min {errs.min():.2e}, max {errs.max():.2e}")
-        for stop, n in Counter(r["stop"] for r in runs).items():
-            print(f"    {n:2d} stopped by: {stop}")
+            rho_v = spearmanr(v, errs)
+            i = int(np.argmin(v))
+            s["validation_t_end"] = sorted({r.get("validation_t_end", 1.0) for r in runs})
+            s["spearman_validation_loss_vs_error"] = {"rho": float(rho_v.statistic),
+                                                      "p": float(rho_v.pvalue)}
+            s["lowest_validation_loss"] = {"seed": runs[i]["seed"], "error": float(errs[i]),
+                                           "rank": int((errs < errs[i]).sum()) + 1}
+            s["best_of_k_by_validation_loss"] = [best_of_k(errs, v, k, threshold=threshold)
+                                                 for k in ks if k <= n]
+            print(f"    V on t <= {s['validation_t_end']}: Spearman(V, error) = "
+                  f"{rho_v.statistic:+.2f} (p = {rho_v.pvalue:.3f}); the run with the lowest V, "
+                  f"seed {runs[i]['seed']}, has error {errs[i]:.2e} (rank "
+                  f"{s['lowest_validation_loss']['rank']} of {n})")
+            for b in s["best_of_k_by_validation_loss"]:
+                print(f"    lowest V of {b['k']} ({b['n_sets']} sets): median {b['median']:.2e}, "
+                      f"<= {PAPER_ERROR:g} in {b['share_at_or_below_paper']:.0%}, > {threshold:g} in "
+                      f"{b['share_above_threshold']:.0%} (one run: {hits / n:.0%}, {fails / n:.0%})")
+    if all(d in summary for d in DTYPES):
+        e32 = {r["seed"]: r["relative_l2_error"] for r in summary["float32"]["runs"]}
+        e64 = {r["seed"]: r["relative_l2_error"] for r in summary["float64"]["runs"]}
+        both = sorted(set(e32) & set(e64))
+        summary["paired_by_seed"] = {"n": len(both),
+                                     "float64_lower": int(sum(e64[s] < e32[s] for s in both))}
+        print(f"float64 below float32 on {summary['paired_by_seed']['float64_lower']} of "
+              f"{len(both)} seeds")
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text(json.dumps(summary, indent=2))
     print(f"[ok] {out}")
@@ -288,12 +397,18 @@ if __name__ == "__main__":
     p.add_argument("--seeds", nargs="+", type=int, default=list(range(20)))
     p.add_argument("--dtype", choices=list(DTYPES), default="float32")
     p.add_argument("--out", default=None, help="default: results/raissi/<dtype>/all.json")
-    p.add_argument("--params-dir", default=None, help="save each seed's final parameters here")
+    p.add_argument("--params-dir", default=None,
+                   help="save each seed's final parameters here (default: params/ next to --out)")
     p.add_argument("--summarize", action="store_true")
-    p.add_argument("--root", default="results/raissi", help="--summarize: folder with <dtype>/*.json")
+    p.add_argument("--rescore", action="store_true",
+                   help="recompute V on the authors' domain from the saved parameters")
+    p.add_argument("--root", default="results/raissi",
+                   help="--summarize, --rescore: folder with <dtype>/*.json")
     p.add_argument("--summary-out", default="results/raissi_repro.json")
     a = p.parse_args()
-    if a.summarize:
+    if a.rescore:
+        rescore(a.root)
+    elif a.summarize:
         summarize(a.root, a.summary_out)
     else:
         main(a.seeds, a.dtype, a.out or f"results/raissi/{a.dtype}/all.json", a.params_dir)

@@ -12,13 +12,17 @@
    reports the loss decrease per evaluation and the error against the exact solution before and
    after, i.e. what continuing past the recipe's stopping point is worth, and the loss against
    the number of evaluations for both (loss_curve: [evaluations, loss] at every accepted point).
-4. Plots both (figures/lbfgs_memory_test.png): the loss against evaluations, and y's at every
-   accepted step against torch's threshold 1e-10.
+4. Locates where torch's memory freezes: the last step whose pair passes torch's test, after
+   which no pair does. It reports the loss and the number of evaluations at that point, and the
+   loss decrease per evaluation of both optimizers before and after it, over the same
+   evaluations, plus L-BFGS-B's rate from the loss at which torch froze ("freeze" in the JSON).
+5. Plots both (figures/lbfgs_memory_test.png): the loss against evaluations, and y's at every
+   accepted step against torch's threshold 1e-10, with the freeze marked on both panels.
 
 Usage:
     python -m scripts.lbfgs_memory_test                    # seed 0, 600 evaluations each
     python -m scripts.lbfgs_memory_test --seed 3 --evals 1000
-    python -m scripts.lbfgs_memory_test --plot-only        # redraw the figure from the JSON
+    python -m scripts.lbfgs_memory_test --plot-only        # redo 4 and 5 from the JSON
 """
 
 from __future__ import annotations
@@ -118,6 +122,63 @@ def report(name: str, pb: Problem, iterates: list, evals: int, curve: list,
             "ys": ys.tolist(), "minus_gs": gs.tolist()}
 
 
+def _loss_at(curve: np.ndarray, evals: float) -> float:
+    """Loss after ``evals`` evaluations, interpolated linearly between accepted points."""
+    return float(np.interp(evals, curve[:, 0], curve[:, 1]))
+
+
+def _rate(curve: np.ndarray, e0: float, e1: float) -> float | None:
+    return None if e1 <= e0 else (_loss_at(curve, e0) - _loss_at(curve, e1)) / (e1 - e0)
+
+
+def freeze(result: dict) -> dict | None:
+    """Where torch's memory freezes, and the loss decrease per evaluation of both optimizers
+    before and after that point (None if torch still keeps a pair at its last step). Steps are
+    numbered from 1; loss_curve[j] is the point reached after step j."""
+    ys = np.array(result["torch"]["ys"], dtype=float)
+    kept = np.flatnonzero(ys > 1e-10)
+    last = int(kept[-1]) + 1 if len(kept) else 0          # last step whose pair torch keeps
+    if last == len(ys):
+        return None
+    tc = np.array(result["torch"]["loss_curve"], dtype=float)
+    lc = np.array(result["lbfgsb"]["loss_curve"], dtype=float)
+    e, f = float(tc[last, 0]), float(tc[last, 1])
+    end = float(min(tc[-1, 0], lc[-1, 0]))
+    after = ys[last:]
+    # the evaluation at which L-BFGS-B first reaches the loss at which torch froze
+    reach = lc[lc[:, 1] <= f]
+    e_same = float(reach[0, 0]) if len(reach) else None
+    return {"last_step_kept": last, "steps": int(len(ys)), "evals": e, "loss": f,
+            "evals_compared": [e, end],
+            "ys_after": [float(after.min()), float(np.median(after)), float(after.max())],
+            "rate_before": {"torch": _rate(tc, 0, e), "lbfgsb": _rate(lc, 0, e)},
+            "rate_after": {"torch": _rate(tc, e, end), "lbfgsb": _rate(lc, e, end)},
+            "lbfgsb_rate_from_same_loss": None if e_same is None else _rate(lc, e_same, end),
+            "lbfgsb_evals_to_same_loss": e_same}
+
+
+def describe_freeze(fr: dict | None) -> str:
+    if fr is None:
+        return "torch keeps pairs up to its last step: no freeze within the budget"
+    msg = (f"torch keeps no pair after step {fr['last_step_kept']} of {fr['steps']} "
+           f"(evaluation {fr['evals']:.0f}, loss {fr['loss']:.4e}); y's after it "
+           f"{fr['ys_after'][0]:.1e}-{fr['ys_after'][2]:.1e} (median {fr['ys_after'][1]:.1e})")
+    b, a = fr["rate_before"], fr["rate_after"]
+    if b["torch"] is not None:
+        msg += (f"\n  loss decrease per evaluation before: torch {b['torch']:.2e}, "
+                f"L-BFGS-B {b['lbfgsb']:.2e}")
+    def ratio(r):
+        return f" ({r / a['torch']:.0f}x)" if a["torch"] and a["torch"] > 0 else ""
+
+    msg += (f"\n  after (evaluations {fr['evals_compared'][0]:.0f}-{fr['evals_compared'][1]:.0f}): "
+            f"torch {a['torch']:.2e}, L-BFGS-B {a['lbfgsb']:.2e}{ratio(a['lbfgsb'])}")
+    if fr["lbfgsb_rate_from_same_loss"] is not None:
+        msg += (f"\n  L-BFGS-B from the same loss (reached at evaluation "
+                f"{fr['lbfgsb_evals_to_same_loss']:.0f}): {fr['lbfgsb_rate_from_same_loss']:.2e}"
+                f"{ratio(fr['lbfgsb_rate_from_same_loss'])}")
+    return msg
+
+
 LABELS = {"torch": "torch.optim.LBFGS (earlier version)",
           "lbfgsb": "SciPy L-BFGS-B (authors' optimizer)"}
 
@@ -144,6 +205,12 @@ def plot(result: dict, out_fig: str = "figures/lbfgs_memory_test.png") -> None:
     ax1.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
     ax2.axhline(1e-10, color="grey", lw=1, ls="--",
                 label="torch's threshold: a pair is kept only if y's > 1e-10")
+    fr = result.get("freeze")
+    if fr is not None and fr["last_step_kept"] > 0:
+        ax1.axvline(fr["evals"], color="grey", lw=1, ls=":",
+                    label=f"torch keeps no pair from here on (evaluation {fr['evals']:.0f})")
+        ax2.axvline(fr["last_step_kept"] + 0.5, color="grey", lw=1, ls=":",
+                    label=f"torch's last kept pair: step {fr['last_step_kept']}")
     ax2.set_xlabel("accepted step")
     ax2.set_ylabel("y's of the step")
     # Legends go under the axes so they do not cover the data.
@@ -177,6 +244,13 @@ def main(seed: int = 0, evals: int = 600, out: str = "results/lbfgs_memory_test.
               f"y's/(-g's) {r['median_ys_over_minus_gs']:.3f}; loss {r['loss_start']:.4e} -> "
               f"{r['loss_end']:.4e} ({r['loss_drop_per_eval']:.2e}/eval); error "
               f"{r['error_start']:.3e} -> {r['error_end']:.3e}", flush=True)
+    return analyse(result, out, out_fig)
+
+
+def analyse(result: dict, out: str, out_fig: str) -> dict:
+    """Locate the freeze, store it in the JSON and draw the figure."""
+    result["freeze"] = freeze(result)
+    print(describe_freeze(result["freeze"]), flush=True)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text(json.dumps(result, indent=2))
     print(f"[ok] {out}")
@@ -194,6 +268,6 @@ if __name__ == "__main__":
     p.add_argument("--plot-only", action="store_true")
     a = p.parse_args()
     if a.plot_only:
-        plot(json.loads(Path(a.out).read_text()), a.fig)
+        analyse(json.loads(Path(a.out).read_text()), a.out, a.fig)
     else:
         main(a.seed, a.evals, a.out, out_fig=a.fig)

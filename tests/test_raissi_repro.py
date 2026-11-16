@@ -56,6 +56,7 @@ def test_run_trains_in_the_requested_precision(dtype, tmp_path):
     assert r["dtype"] == dtype and r["final_loss"] < f and r["n_params"] == 3_021
     v = r["validation_loss"]                             # Section 8's V, in the run's precision
     assert np.isclose(v["total"], v["pde"] + v["bc"] + v["ic"]) and v["total"] > 0
+    assert r["validation_t_end"] == 0.99                 # on the authors' domain
     saved = np.load(tmp_path / "seed00.npy")             # the optimizer's final vector
     pb2 = raissi_repro.Problem(1, dtype, **SMALL)
     pb2.set_x(saved)                                     # reloads the same network
@@ -85,7 +86,88 @@ def test_lbfgs_memory_test_reports_both_optimizers(tmp_path):
         assert r[name]["pairs_kept_by_lbfgsb_test"] <= r[name]["iterations"]
         assert r[name]["loss_end"] <= r[name]["loss_start"]
         assert r[name]["loss_curve"][0] == [0, r[name]["loss_start"]]
-    assert json.loads((tmp_path / "m.json").read_text())["seed"] == 0
+    saved = json.loads((tmp_path / "m.json").read_text())
+    assert saved["seed"] == 0 and "freeze" in saved
+
+
+def test_freeze_is_located_and_both_rates_compared():
+    from scripts import lbfgs_memory_test as m
+
+    res = {"torch": {"ys": [1e-9, 1e-9, 1e-12, 1e-12],
+                     "loss_curve": [[0, 1.0], [2, 0.8], [4, 0.6], [6, 0.599], [8, 0.598]]},
+           "lbfgsb": {"loss_curve": [[0, 1.0], [2, 0.9], [4, 0.8], [6, 0.6], [8, 0.4]]}}
+    fr = m.freeze(res)
+    assert (fr["last_step_kept"], fr["evals"], fr["loss"]) == (2, 4, 0.6)
+    assert fr["rate_before"]["torch"] == pytest.approx(0.1)        # (1.0 - 0.6) / 4
+    assert fr["rate_before"]["lbfgsb"] == pytest.approx(0.05)      # (1.0 - 0.8) / 4
+    assert fr["rate_after"]["torch"] == pytest.approx(0.0005)      # (0.6 - 0.598) / 4
+    assert fr["rate_after"]["lbfgsb"] == pytest.approx(0.1)        # (0.8 - 0.4) / 4
+    assert fr["lbfgsb_evals_to_same_loss"] == 6                    # L-BFGS-B reaches 0.6 there
+    assert fr["lbfgsb_rate_from_same_loss"] == pytest.approx(0.1)  # (0.6 - 0.4) / 2
+    assert "after step 2" in m.describe_freeze(fr)
+    res["torch"]["ys"] = [1e-9] * 4                                # keeps a pair at every step
+    assert m.freeze(res) is None
+    res["torch"]["ys"] = [1e-12] * 4                               # frozen from the first step
+    fr = m.freeze(res)
+    assert fr["last_step_kept"] == 0 and fr["rate_before"]["torch"] is None
+
+
+def test_clopper_pearson_matches_its_closed_forms():
+    lo, hi = raissi_repro.clopper_pearson(0, 20)
+    assert lo == 0 and hi == pytest.approx(1 - 0.025 ** (1 / 20))   # 0.168
+    lo, hi = raissi_repro.clopper_pearson(20, 20)
+    assert hi == 1 and lo == pytest.approx(0.025 ** (1 / 20))       # 0.832
+    lo, hi = raissi_repro.clopper_pearson(10, 20)
+    assert lo + hi == pytest.approx(1.0)
+
+
+def test_best_of_k_enumerates_every_set():
+    errs = [1.0, 2.0, 3.0, 4.0]
+    b = raissi_repro.best_of_k(errs, errs, 2, paper=1.0, threshold=2.5)    # a perfect score
+    assert b["n_sets"] == 6 and b["median"] == 1.5                         # picks 1 1 1 2 2 3
+    assert b["share_at_or_below_paper"] == pytest.approx(3 / 6)
+    assert b["share_above_threshold"] == pytest.approx(1 / 6)
+    w = raissi_repro.best_of_k(errs, [-e for e in errs], 2, paper=1.0, threshold=2.5)  # backwards
+    assert w["median"] == 3.5 and w["share_at_or_below_paper"] == 0          # picks 2 3 3 4 4 4
+
+
+def test_summarize_reports_rates_intervals_and_rankings(tmp_path):
+    def runs(errs, v, loss):
+        return [{"seed": s, "relative_l2_error": e, "final_loss": l, "max_abs_grad": 1e-5,
+                 "n_evals": 100, "stop": "STOP", "n_params": 3021, "validation_t_end": 0.99,
+                 "validation_loss": {"total": vv}} for s, (e, vv, l) in enumerate(zip(errs, v, loss))]
+    for dtype, errs in (("float32", [2e-3, 3e-3, 1.5e-3, 5e-3]), ("float64", [5e-4, 2e-3, 8e-4, 6e-4])):
+        (tmp_path / dtype).mkdir()
+        (tmp_path / dtype / "p.json").write_text(json.dumps(
+            {"runs": runs(errs, v=errs, loss=[1.0, 1.0, 2.0, 0.5])}))
+    s = raissi_repro.summarize(str(tmp_path), str(tmp_path / "s.json"))
+    f64 = s["float64"]
+    assert f64["n_above_threshold"] == 1 and f64["n_at_or_below_paper"] == 2
+    assert f64["ci95_above_threshold"] == raissi_repro.clopper_pearson(1, 4)
+    assert (f64["best_seed"], f64["worst_seed"]) == (0, 1)
+    assert f64["spearman_validation_loss_vs_error"]["rho"] == pytest.approx(1.0)
+    assert f64["lowest_validation_loss"] == {"seed": 0, "error": 5e-4, "rank": 1}
+    assert [b["k"] for b in f64["best_of_k_by_validation_loss"]] == [3]       # C(4, 5) is empty
+    assert s["paired_by_seed"] == {"n": 4, "float64_lower": 4}
+
+
+def test_rescore_recomputes_v_on_the_authors_domain_from_saved_parameters(tmp_path):
+    d = tmp_path / "float32"
+    pb = raissi_repro.Problem(0, "float32", **SMALL)
+    r = raissi_repro.run(0, "float32", options=dict(raissi_repro.AUTHORS_OPTIONS, maxiter=5),
+                         problem=pb, params_dir=str(d / "params"))
+    expected = r["validation_loss"]["total"]
+    r["validation_loss"] = {"total": 1.0}                 # as a run scored on another grid
+    del r["validation_t_end"]
+    (d / "p.json").write_text(json.dumps({"runs": [r]}))
+    raissi_repro.rescore(str(tmp_path))
+    r2 = json.loads((d / "p.json").read_text())["runs"][0]
+    assert r2["validation_t_end"] == 0.99
+    assert r2["validation_loss"]["total"] == pytest.approx(expected, rel=1e-5)
+    r2["relative_l2_error"] *= 2                          # a saved network that does not match
+    (d / "p.json").write_text(json.dumps({"runs": [r2]}))
+    with pytest.raises(ValueError, match="saved network"):
+        raissi_repro.rescore(str(tmp_path))
 
 
 def _quadratic(scale: float, n: int = 50):

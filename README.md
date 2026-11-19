@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](https://opensource.org/licenses/MIT)
 [![Portfolio page](https://img.shields.io/badge/Portfolio-page-7C3AED?style=flat-square)](https://crozol.github.io/projects/04-pinns.html)
 
-**TL;DR** — Two PDEs solved with physics-informed neural networks (Raissi, Perdikaris & Karniadakis, 2019): the loss combines the PDE residual, computed via automatic differentiation at collocation points, with the initial/boundary conditions — no mesh, no training data beyond those conditions. The 1D heat equation reaches **0.23% relative L2 error** against its closed-form solution (Adam + a short L-BFGS pass), but that is a global figure: the PINN's absolute error stays near `10⁻³` while the solution decays by `5 × 10⁻⁵`, so the relative error per time slice passes 10% after `t ≈ 0.6` (Section 4). The 1D viscous Burgers equation (`nu = 0.01/pi`, the classic benchmark with a thin internal layer at `x = 0`) is harder: Adam alone plateaus at **~8.8%**; L-BFGS fine-tuning on a fixed point batch brings it to **1.78%** against the exact Cole-Hopf solution. Getting there surfaced a silent failure mode of L-BFGS with resampled collocation points (Section 5.4). Across 5 seeds the errors are **0.14% ± 0.05%** (heat) and **1.66% ± 0.49%** (Burgers). The Burgers result is sensitive to the untuned boundary-loss weight (Section 8). The original paper reports 0.067% on Burgers. Its recipe as released — SciPy's L-BFGS-B with the authors' options, in float32 — stays above `10⁻³` on all 20 seeds and never reaches that number (95% CI for the rate: 0–17%); the same recipe in float64 reaches it on 4 of 20. The final training loss does not tell good runs from bad ones; the residual on a fresh grid, computed without the exact solution, does (Spearman ρ = 0.54–0.58), and keeping the best of 5 seeds by it leaves 13% of float64 picks above `10⁻³`, against 50% of single runs (Section 9). Stack: PyTorch (autograd, `torch.optim.LBFGS`) · SciPy (L-BFGS-B for the paper's recipe, reference solutions) · NumPy · Matplotlib.
+**TL;DR** — Two PDEs solved with physics-informed neural networks (Raissi, Perdikaris & Karniadakis, 2019): the loss combines the PDE residual, computed via automatic differentiation at collocation points, with the initial/boundary conditions — no mesh, no training data beyond those conditions. The 1D heat equation reaches **0.14% ± 0.05%** relative L2 error across 5 seeds against its closed-form solution (Adam + a short L-BFGS pass; 0.23% in the frozen run of the figures), but that is a global figure: the PINN's absolute error stays near `10⁻³` while the solution decays by `5 × 10⁻⁵`, so the relative error per time slice passes 10% after `t ≈ 0.6` (Section 4). The 1D viscous Burgers equation (`nu = 0.01/pi`, the classic benchmark with a thin internal layer at `x = 0`) is harder: Adam alone plateaus at **~8.8%**; L-BFGS fine-tuning on a fixed point batch brings it to **1.66% ± 0.49%** across 5 seeds (1.78% in the frozen run) against the exact Cole-Hopf solution. Getting there surfaced a silent failure mode of L-BFGS with resampled collocation points (Section 5.4). The Burgers result is sensitive to the untuned boundary-loss weight (Section 8). The original paper reports 0.067% on Burgers. Its recipe as released — SciPy's L-BFGS-B with the authors' options, in float32 — stays above `10⁻³` on all 20 seeds and never reaches that number (95% CI for the rate: 0–17%); the same recipe in float64 reaches it on 4 of 20. The final training loss does not tell good runs from bad ones; the residual on a fresh grid, computed without the exact solution, does (Spearman ρ = 0.54–0.58), and keeping the best of 5 seeds by it leaves 13% of float64 picks above `10⁻³` (bootstrap 95% interval 1–46%), against 50% of single runs (Section 9). Stack: PyTorch (autograd, `torch.optim.LBFGS`) · SciPy (L-BFGS-B for the paper's recipe, reference solutions) · NumPy · Matplotlib.
 
 The document walks through both cases in the order they were actually solved —
 including the point where the obvious approach quietly didn't work — rather
@@ -555,6 +555,14 @@ In float32 the rule lowers the median from `2.0 × 10⁻³` to `1.45 × 10⁻³`
 like every float32 run. The two correlations with `V` are two tests, one per precision; both
 p-values stay below 0.025, the Bonferroni threshold for two tests at 0.05.
 
+These rates come from the same 20 runs. A bootstrap over the runs (`scripts/validation_rule.py`,
+2 000 resamples) gives 95% intervals of 0–81% for reaching the published value and 1–46% for
+staying above `10⁻³`, and the rule recovers 0.49 of the gain an oracle would get (−0.18 to
+1.00): with 20 runs its worth is uncertain. Nor does the gap between `V` and the training loss
+isolate overfitting of the collocation points: it correlates with the error no better than `V`
+(ρ = 0.47 against 0.54 in float64, 0.59 against 0.58 in float32), because the training loss
+varies little across runs.
+
 ### 9.6 · Remaining differences
 
 PyTorch instead of TensorFlow (same arithmetic, different rounding and random streams); SciPy's
@@ -590,6 +598,7 @@ python -m scripts.bc_weight_sweep    # Section 8, ~1 h per weight on one core
 python -m scripts.raissi_repro --dtype float32   # Section 9, 20 seeds, ~10 min per seed
 python -m scripts.raissi_repro --dtype float64   # ~15-20 min per seed
 python -m scripts.raissi_repro --summarize       # rates, 95% intervals, V ranking -> results/raissi_repro.json
+python -m scripts.validation_rule                # Section 9.5: bootstrap of the V rule, V - L_train gap
 python -m scripts.lbfgs_memory_test              # Section 9.2 table and figure
 python -m scripts.authors_reference              # Section 9.6: the authors' reference against Cole-Hopf (downloads it)
 # per-seed numbers depend on the thread count (Section 9.6); the runs above used OMP_NUM_THREADS=2
@@ -630,7 +639,8 @@ on Burgers, not a qualitative change in the conclusions above.
 │   ├── reference_convergence.py  # error floor of the Cole-Hopf reference + Chebyshev resolution
 │   ├── raissi_repro.py        # Burgers with the original paper's recipe (SciPy L-BFGS-B, float32 + float64)
 │   ├── lbfgs_memory_test.py   # torch.optim.LBFGS vs. L-BFGS-B from the recipe's stopping point
-│   └── authors_reference.py   # the authors' burgers_shock.mat against the Cole-Hopf solution
+│   ├── authors_reference.py   # the authors' burgers_shock.mat against the Cole-Hopf solution
+│   └── validation_rule.py     # bootstrap of the "lowest V of k" rule, V - L_train gap
 ├── tests/                  # pytest: residual correctness, reference sanity, training smoke test
 └── figures/                 # PINN-vs-reference comparison plots + loss curve (tracked)
 ```

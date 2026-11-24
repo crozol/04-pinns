@@ -4,8 +4,8 @@ type: software
 title: "Physics-Informed Neural Networks (PINNs)"
 abstract: "Physics-informed neural networks for the 1D heat equation and the 1D viscous Burgers equation, validated against their exact solutions (separation of variables; Cole-Hopf). The Burgers recipe of Raissi, Perdikaris & Karniadakis (2019) is rerun over 20 seeds with the authors' optimizer, in float32 and float64. The final training loss and the PDE residual on a fresh grid are compared as ways to tell good runs from bad ones without the exact solution."
 authors:
-  - given-names: "Camilo Andrés"
-    family-names: "Rozo Lozano"
+  - given-names: "Camilo A."
+    family-names: "Rozo L."
     affiliation: "Universidad Nacional de Colombia"
     email: rozol.ca555@gmail.com
 repository-code: "https://github.com/crozol/04-pinns"

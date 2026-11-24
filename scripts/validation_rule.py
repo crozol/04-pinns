@@ -1,6 +1,6 @@
 """How much the validation rule (keep the run with the lowest V) is worth, with its uncertainty.
 
-Two questions from the external review of 2026-11-19, on the 20 runs per precision of the
+Two questions on the 20 runs per precision of the
 Raissi recipe (results/raissi/<dtype>/*.json, the runs of README §9):
 
 1. The rule "of k runs, keep the one with the lowest V" was measured over every set of k of the
